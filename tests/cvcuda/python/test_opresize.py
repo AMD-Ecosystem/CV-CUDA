@@ -46,6 +46,7 @@ RNG = np.random.default_rng(0)
         (((37, 19, 3), np.uint8, "HWC"), (113, 47, 3), cvcuda.Interp.NEAREST),
         (((37, 19, 1), np.single, "HWC"), (113, 47, 1), None),
         (((37, 19, 3), np.single, "HWC"), (113, 47, 3), None),
+        (((37, 19, 3), np.float16, "HWC"), (113, 47, 3), cvcuda.Interp.LINEAR),
         # Planar (NCHW/CHW) layouts.
         (
             ((5, 3, 16, 23), np.uint8, "NCHW"),
@@ -54,6 +55,22 @@ RNG = np.random.default_rng(0)
         ),
         (((4, 16, 23), np.uint8, "CHW"), (4, 132, 15), cvcuda.Interp.CUBIC),
         (((3, 37, 19), np.single, "CHW"), (3, 113, 47), cvcuda.Interp.NEAREST),
+        # NEAREST_FLOOR, interleaved and planar, upscale and downscale.
+        (
+            ((37, 19, 3), np.uint8, "HWC"),
+            (113, 47, 3),
+            cvcuda.Interp.NEAREST_FLOOR,
+        ),
+        (
+            ((113, 47, 3), np.uint8, "HWC"),
+            (37, 19, 3),
+            cvcuda.Interp.NEAREST_FLOOR,
+        ),
+        (
+            ((3, 37, 19), np.single, "CHW"),
+            (3, 113, 47),
+            cvcuda.Interp.NEAREST_FLOOR,
+        ),
     ],
 )
 def test_op_resize(input_args, out_shape, interp):
@@ -110,6 +127,7 @@ def test_op_resize(input_args, out_shape, interp):
         ((1, 37, 19, 3), (1, 113, 47, 3), np.uint8, cvcuda.Interp.NEAREST),  # noqa
         ((1, 37, 19, 1), (1, 113, 47, 1), np.float32, cvcuda.Interp.LINEAR),  # noqa
         ((1, 37, 19, 3), (1, 113, 47, 3), np.float32, cvcuda.Interp.LINEAR),  # noqa
+        ((1, 37, 19, 3), (1, 113, 47, 3), np.float16, cvcuda.Interp.LINEAR),  # noqa
     ],
 )
 def test_op_resize_packed_cuda_tensor(in_shape, out_shape, data_type, interp):
@@ -254,6 +272,41 @@ def _resize_varshape_params(dtype, layout, channels):
     }
 
 
+def test_op_resize_nearest_floor_sampling_rule():
+    """NEAREST samples the destination pixel's center; NEAREST_FLOOR drops the offset."""
+    src_w, src_h, dst_w = 320, 1, 299
+    # A horizontal ramp makes the selected source column readable straight off the output.
+    ramp = np.arange(src_w, dtype=np.uint8).reshape(src_h, src_w, 1)
+    src = cvcuda.as_tensor(cupy.asarray(ramp), layout="HWC")
+
+    got_nearest = cupy.asnumpy(
+        cupy.asarray(
+            cvcuda.resize(src, (src_h, dst_w, 1), cvcuda.Interp.NEAREST).cuda()
+        )
+    ).ravel()
+    got_floor = cupy.asnumpy(
+        cupy.asarray(
+            cvcuda.resize(src, (src_h, dst_w, 1), cvcuda.Interp.NEAREST_FLOOR).cuda()
+        )
+    ).ravel()
+
+    scale = np.float32(src_w) / dst_w
+    x = np.arange(dst_w, dtype=np.float32)
+    expect_nearest = np.minimum(np.floor((x + 0.5) * scale), src_w - 1).astype(np.uint8)
+    expect_floor = np.minimum(np.floor(x * scale), src_w - 1).astype(np.uint8)
+
+    np.testing.assert_array_equal(got_nearest, expect_nearest)
+    np.testing.assert_array_equal(got_floor, expect_floor)
+    assert not np.array_equal(got_nearest, got_floor)
+
+
+def test_op_resize_nearest_floor_rejected_by_other_operators():
+    """NEAREST_FLOOR is Resize-only; operators validating against an allowlist reject it."""
+    src = cvcuda.Tensor((32, 24, 4), cvcuda.Type.U8, "HWC")
+    with pytest.raises(Exception):
+        cvcuda.rotate(src, 90.0, [0.0, 0.0], cvcuda.Interp.NEAREST_FLOOR)
+
+
 globals().update(
     cv_tools.make_op_tests(
         name="resize",
@@ -266,6 +319,7 @@ globals().update(
             cvcuda.Type.U8,
             cvcuda.Type.U16,
             cvcuda.Type.S16,
+            cvcuda.Type.F16,
             cvcuda.Type.F32,
         },
         supported_layouts={"NHWC", "HWC", "NCHW", "CHW"},

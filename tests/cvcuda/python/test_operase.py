@@ -26,7 +26,7 @@ def _zeroed(tensor):
     # cvcuda.Tensor leaves device memory uninitialized; erase validates its anchor, so zero the
     # parameter tensors to give it well-defined (no-op) values instead of whatever the allocator
     # pool happens to hold.
-    cupy.asarray(tensor.cuda())[...] = 0
+    cupy.asarray(tensor.cuda()).view(cupy.uint8)[...] = 0
     return tensor
 
 
@@ -35,6 +35,7 @@ def _zeroed(tensor):
     [
         (((1, 460, 640, 3), cvcuda.Type.U8, "NHWC"), 1, False, 0),
         (((5, 460, 640, 3), cvcuda.Type.U8, "NHWC"), 1, True, 1),
+        (((2, 15, 21, 3), cvcuda.Type.F16, "NHWC"), 1, False, 0),
     ],
 )
 def test_op_erase(input_args, erasing_area_num, random, seed):
@@ -280,6 +281,7 @@ globals().update(
             cvcuda.Type.U16,
             cvcuda.Type.S16,
             cvcuda.Type.S32,
+            cvcuda.Type.F16,
             cvcuda.Type.F32,
         },
         supported_layouts={"NHWC", "HWC", "NCHW", "CHW"},

@@ -18,15 +18,21 @@
 /**
  * @file AdjustColorCommon.cuh
  *
- * @brief Device helpers for torchvision-compatible image-range clamping and AdjustContrast.
+ * @brief Shared helpers for AdjustContrast and BrightnessContrast: round-mode validation, output
+ *        rounding, and torchvision-compatible image-range clamping.
  */
 
 #ifndef CVCUDA_PRIV_ADJUST_COLOR_COMMON_CUH
 #define CVCUDA_PRIV_ADJUST_COLOR_COMMON_CUH
 
+#include "PhotometricBound.cuh"
+
 #include <cuda_runtime.h>
+#include <cvcuda/cuda_tools/MathWrappers.hpp>
 #include <cvcuda/cuda_tools/SaturateCast.hpp>
 #include <cvcuda/cuda_tools/TypeTraits.hpp>
+#include <nvcv/Exception.hpp>
+#include <nvcv/RoundMode.h>
 
 #include <type_traits>
 
@@ -34,20 +40,36 @@ namespace cvcuda::priv::adjust {
 
 namespace cuda = nvcv::cuda;
 
-// torchvision's per-dtype clamp bound (``_max_value``): 1.0 for floating-point images and the
-// dtype maximum for integer images. AdjustContrast uses this bound to match torchvision's
-// image-domain ``_blend`` behavior.
-template<typename BT>
-inline __host__ __device__ float Bound()
+inline void ValidateRoundMode(NVCVRoundMode roundMode)
 {
-    if constexpr (std::is_floating_point_v<BT>)
+    if (roundMode != NVCV_ROUND_NEAREST && roundMode != NVCV_ROUND_TRUNCATE)
     {
-        return 1.0f;
+        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Invalid round mode %d",
+                              static_cast<int>(roundMode));
     }
-    else
+}
+
+// Apply truncate-toward-zero rounding to each channel of ``value`` before the final SaturateCast.
+// When ``truncate`` is false (NVCV_ROUND_NEAREST) this is the identity. Float destinations are
+// unaffected regardless of ``truncate``. Kernel-wide arg; branch is uniform across the grid.
+template<typename DstT, typename T>
+inline __device__ T RoundForOutput(T value, bool truncate)
+{
+    using DstBT = cuda::BaseType<DstT>;
+    if constexpr (std::is_integral_v<DstBT>)
     {
-        return static_cast<float>(cuda::TypeTraits<BT>::max);
+        if (truncate)
+        {
+            static constexpr int numElements = cuda::NumElements<T>;
+#pragma unroll
+            for (int c = 0; c < numElements; ++c)
+            {
+                auto &v = cuda::GetElement(value, c);
+                v       = cuda::round<cuda::RoundMode::ZERO>(v);
+            }
+        }
     }
+    return value;
 }
 
 // torchvision BT.601 luma weights used by adjust_contrast's grayscale conversion. These differ
@@ -59,15 +81,13 @@ inline constexpr float kLumaB = 0.114f;
 // torchvision ``_blend`` for one channel component, evaluated in the float domain then clamped to
 // [0, bound] and saturate-cast back to the base type:
 //   out = SaturateCast(clamp(ratio * in + (1 - ratio) * other, 0, bound))
-// adjust_contrast passes the per-image grayscale mean as ``other``. Integer results round-to-nearest
-// via SaturateCast (torchvision truncates, so integer outputs may differ by <=1 LSB); float results
-// are the bit-exact clamped affine.
+// adjust_contrast passes the per-image grayscale mean as ``other``.
 template<typename BT>
-inline __device__ BT Blend(BT v, float ratio, float other, float bound)
+inline __device__ BT Blend(BT v, float ratio, float other, float bound, bool truncate)
 {
     float pixel = ratio * static_cast<float>(v) + (1.0f - ratio) * other;
     pixel       = pixel < 0.0f ? 0.0f : (pixel > bound ? bound : pixel);
-    return cuda::SaturateCast<BT>(pixel);
+    return cuda::SaturateCast<BT>(RoundForOutput<BT>(pixel, truncate));
 }
 
 // torchvision adjust_contrast grayscale value from explicit R, G, B base components (used by the

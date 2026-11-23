@@ -5,12 +5,8 @@
 
 The single source of truth for adding a **new** operator to CV-CUDA end-to-end. It is
 **implemented by** `tools/make_op.py` (the deterministic checker) and **cited by** the thin
-per-tool wrappers (`.claude/commands/make-op*.md`, `.codex/skills/make-op*/SKILL.md`). The
-checklist substance lives here once; both Claude and Codex delegate to it — no duplication.
-
-This document also **documents the skill** (purpose, modes, workflow, invocation), exactly as
-`OPTIMIZATION_GUIDELINES.md` documents `/optimize-op`. It does not restate house policy; it
-*cites* the authoritative docs and turns their requirements into machine-checkable items:
+skill dispatchers (`.agents/skills/op-tools/skills/make-op*/SKILL.md`). It also documents the
+skill's modes, workflow, and invocation, and turns these docs into machine-checkable items:
 `AGENTS.md`, `docs/sphinx/advanced/make_operator.rst` (the narrative tutorial),
 `REVIEW_OP_GUIDELINES.md`, and `OPTIMIZATION_GUIDELINES.md`.
 
@@ -143,7 +139,7 @@ the relnotes, and optimization-ready.
 | IMP-1 | No stub markers | `TODO`, `t.fail`, `noop`, the template's `std::generate(goldVec…)` / placeholder `ASSERT_EQ(goldVec, testVec)` | none remain in the op's src/test |
 | IMP-2 | Limitations table filled | header | no `TODO`/`[TODO]` rows (also SPEC-MATRIX) |
 | IMP-3 | Multi-GPU safety | if priv has `cudaMalloc`, it uses `PerDeviceResource<>` | satisfied / N-A if no device alloc |
-| NVTX-1 | NVTX marker present **and** registered | `CVCUDA_NVTX_RANGE("cvcuda<Name>…Submit")` in `Op<Name>.cpp` (the scaffold templates emit the submit / priv `operator()` / Python `NvtxTrace` markers — this guards they survived) **and** a `"<name>": ("cvcuda<Name>Submit", _<name>)` row in `tests/cvcuda/python/test_nvtx_markers.py` `OPERATORS` | both present → else GAP. Every public operator (`fn` + `_into`) must be in the registry or `test_all_operators_registered` fails once always-on NVTX is merged; the invocation helper must issue a minimal real call so the submit range actually fires |
+| NVTX-1 | NVTX marker present | `CVCUDA_NVTX_RANGE("cvcuda<Name>…Submit")` in `Op<Name>.cpp` (the scaffold templates emit the submit / priv `operator()` / Python `NvtxTrace` markers — this guards they survived) | present → else GAP. `tests/cvcuda/python/test_nvtx_markers.py` scans every C API submit entry and Python binding for its marker; no registry row is needed |
 
 ### Domain: coverage + test-rigor (the teeth — stricter than `review_op`)
 
@@ -228,33 +224,10 @@ GAPs for a brand-new operator).
   `bench_<op>` + run it (all configs Pass, none unintentionally Skip), and run
   `python3 bench/run_bench.py --operator <op>` to confirm **noise < 5%** and **C++/Python parity**
   (BEN-11; run-dependent, so verified with `--run`/CI, not statically).
-- **Baseline regen (CI, closes `BEN-7`/`RDY-1`):** once the configs are calibrated and run-green
-  **locally**, trigger the named CI `baseline-regen` workflow to seed baselines on the **reference
-  SKUs** and import its artifacts with
-  `python3 bench/_internal/update_baseline.py --from <artifact-dir> --operator <op>` (never fabricate
+- **Baseline regen (closes `BEN-7`/`RDY-1`):** once the configs are calibrated and run-green
+  **locally**, seed baselines on the **reference SKUs** and import the resulting artifacts with
+  the guarded workflow in `bench/README.md` under "Import, Validate, and Recheck" (never fabricate
   baselines).
-  Local absolute timings are SKU-specific, so the gating baselines come from CI, not the dev box;
+  Local absolute timings are SKU-specific, so the gating baselines cannot come from the dev box;
   after import, `make_op.py --phase done` shows `BEN-7`/`RDY-1` green.
-  Current trigger, artifact, and import mechanics live in `bench/README.md` under "Regenerating
-  baselines via CI"; CI selection semantics live in `ci/README.md`.
-- **SonarQube "Sonar way" gate (hard CI gate, `allow_failure=false`):** the MR pipeline runs a
-  SonarQube quality gate that fails on **any** new issue (`new_violations > 0`) and on unreviewed
-  new security hotspots. Existing operators are grandfathered, so a brand-new op's code is judged
-  against a zero-tolerance bar and the idiomatic-but-noncompliant boilerplate trips it. Write the
-  op's `.cpp`/`.hpp`/test/bench **Sonar-clean from the start** (CUDA `.cu` files are excluded from
-  analysis). The recurring rules and their fixes:
-  - **S3608** default lambda capture — use explicit captures (`[handle, stream, in, out]`), never `[&]`.
-  - **S5025** manual `new` — the operator's `Create` transfers ownership to the C handle; keep the
-    `// NOSONAR` on that one line (NOSONAR is honored on NVIDIA's server) rather than fighting it.
-  - **S5817** non-mutating method should be `const` — the public `operator()` is `const`.
-  - **S3471/S3576** redundant `virtual` on an override — write `… handle() const noexcept override;`.
-  - **S1659** multiple declarations per line — one identifier per statement (e.g. split
-    `TensorWrapHandle input(in), output(out);`).
-  - **S6012** redundant class-template args — rely on CTAD (`std::uniform_int_distribution dist(0, m);`).
-  - **S5827** repeated type — `auto`. **S1301** two-case `switch` — use `if`. **S1481** unnecessary
-    lambda capture of a `constexpr`/const-integral — drop it.
-  - **S924** >1 `break`/`goto` per loop — GTest `ASSERT_NO_THROW`/`EXPECT_NO_THROW` expand to `goto`
-    labels, so **don't wrap calls in `*_NO_THROW` inside a loop**; call the helper directly (a throw
-    still fails the test). The `mkop.sh` C-API + C++ templates are already Sonar-clean; this is on
-    the agent-written test/bench code. Verify locally by reading the `sonarqube` job log on the MR.
 - **Samples:** not gated (consistent with `review_op`); optional/manual.

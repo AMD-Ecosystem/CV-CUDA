@@ -17,9 +17,12 @@
 
 #include "ConvUtils.hpp"
 #include "Definitions.hpp"
+#include "HalfTestUtils.hpp"
 #include "PlanarParityUtils.hpp"
 
 #include <common/ValueTests.hpp>
+#include <cuda.h>
+#include <cuda_fp16.h>
 #include <cvcuda/OpGammaContrast.hpp>
 #include <cvcuda/cuda_tools/MathWrappers.hpp>
 #include <cvcuda/cuda_tools/TypeTraits.hpp>
@@ -34,6 +37,154 @@ namespace test = nvcv::test;
 namespace cuda = nvcv::cuda;
 
 constexpr bool DBG_GAMMA_CONTRAST = false;
+
+TEST(OpGammaContrast, tall_packed_u8_tensor_avoids_legacy_grid_limit)
+{
+    constexpr int    kWidth  = 16;
+    constexpr int    kHeight = 65536 * 8;
+    constexpr size_t kBytes  = size_t{kWidth} * kHeight * 3;
+    nvcv::Tensor     src(1, {kWidth, kHeight}, nvcv::FMT_RGB8p, nvcv::MemAlignment{}.rowAddr(1));
+    nvcv::Tensor     dst(1, {kWidth, kHeight}, nvcv::FMT_RGB8p, nvcv::MemAlignment{}.rowAddr(1));
+    nvcv::Tensor     gamma({{1}, "N"}, nvcv::TYPE_F32);
+    auto             srcData   = src.exportData<nvcv::TensorDataStridedCuda>();
+    auto             dstData   = dst.exportData<nvcv::TensorDataStridedCuda>();
+    auto             gammaData = gamma.exportData<nvcv::TensorDataStridedCuda>();
+    ASSERT_TRUE(srcData && dstData && gammaData);
+    nvcv::util::SetTensorTo<float>(*gammaData, 0.75f);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaSuccess, cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    ASSERT_EQ(cudaSuccess, cudaMemsetAsync(srcData->basePtr(), 0, kBytes, stream));
+    ASSERT_EQ(cudaSuccess, cudaMemsetAsync(dstData->basePtr(), 255, kBytes, stream));
+    cvcuda::GammaContrast op(1, 3);
+    EXPECT_NO_THROW(op(stream, src, dst, gamma));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+    std::vector<uint8_t> output(kBytes);
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(output.data(), dstData->basePtr(), kBytes, cudaMemcpyDeviceToHost));
+    EXPECT_EQ(std::vector<uint8_t>(kBytes, 0), output);
+    EXPECT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+TEST(OpGammaContrast, wide_stride_u8_tensor_capture_avoids_int32_legacy)
+{
+    nvcv::Tensor srcStorage(3, {16, 1}, nvcv::FMT_RGB8p, nvcv::MemAlignment{}.rowAddr(1));
+    nvcv::Tensor dstStorage(3, {16, 1}, nvcv::FMT_RGB8p, nvcv::MemAlignment{}.rowAddr(1));
+    nvcv::Tensor gamma({{3}, "N"}, nvcv::TYPE_F32);
+    auto         srcData   = srcStorage.exportData<nvcv::TensorDataStridedCuda>();
+    auto         dstData   = dstStorage.exportData<nvcv::TensorDataStridedCuda>();
+    auto         gammaData = gamma.exportData<nvcv::TensorDataStridedCuda>();
+    ASSERT_TRUE(srcData && dstData && gammaData);
+    nvcv::util::SetTensorTo<uint8_t>(*srcData, 0);
+    nvcv::util::SetTensorTo<float>(*gammaData, 0.75f);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaSuccess, cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    cvcuda::GammaContrast op(3, 3);
+    ASSERT_NO_THROW(op(stream, srcStorage, dstStorage, gamma));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+    const auto checkStride = [&](int64_t sampleStride, bool wideSource)
+    {
+        SCOPED_TRACE(::testing::Message() << sampleStride << ":" << wideSource);
+        nvcv::TensorDataStridedCuda::Buffer srcBuffer{};
+        srcBuffer.basePtr    = reinterpret_cast<NVCVByte *>(srcData->basePtr());
+        srcBuffer.strides[0] = wideSource ? sampleStride : 48;
+        srcBuffer.strides[1] = 16;
+        srcBuffer.strides[2] = 16;
+        srcBuffer.strides[3] = 1;
+        auto dstBuffer       = srcBuffer;
+        dstBuffer.basePtr    = reinterpret_cast<NVCVByte *>(dstData->basePtr());
+        dstBuffer.strides[0] = wideSource ? 48 : sampleStride;
+        const nvcv::TensorShape shape{
+            {3, 3, 1, 16},
+            "NCHW"
+        };
+        nvcv::Tensor src = nvcv::TensorWrapData(nvcv::TensorDataStridedCuda{shape, nvcv::TYPE_U8, srcBuffer});
+        nvcv::Tensor dst = nvcv::TensorWrapData(nvcv::TensorDataStridedCuda{shape, nvcv::TYPE_U8, dstBuffer});
+        ASSERT_EQ(cudaSuccess, cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+        EXPECT_NO_THROW(op(stream, src, dst, gamma));
+        cudaGraph_t graph{};
+        ASSERT_EQ(cudaSuccess, cudaStreamEndCapture(stream, &graph));
+        size_t nodeCount = 0;
+        ASSERT_EQ(cudaSuccess, cudaGraphGetNodes(graph, nullptr, &nodeCount));
+        std::vector<cudaGraphNode_t> nodes(nodeCount);
+        ASSERT_EQ(cudaSuccess, cudaGraphGetNodes(graph, nodes.data(), &nodeCount));
+        int imageKernels = 0;
+        for (cudaGraphNode_t node : nodes)
+        {
+            cudaGraphNodeType type{};
+            ASSERT_EQ(cudaSuccess, cudaGraphNodeGetType(node, &type));
+            if (type != cudaGraphNodeTypeKernel)
+                continue;
+            CUDA_KERNEL_NODE_PARAMS parameters{};
+            ASSERT_EQ(CUDA_SUCCESS, cuGraphKernelNodeGetParams(node, &parameters));
+            EXPECT_EQ(1u, parameters.blockDimY);
+            if (parameters.gridDimY == 3 && parameters.gridDimZ == 3)
+                ++imageKernels;
+        }
+        EXPECT_EQ(1, imageKernels);
+        EXPECT_EQ(cudaSuccess, cudaGraphDestroy(graph));
+    };
+    ASSERT_NO_FATAL_FAILURE(checkStride(int64_t{1} << 30, true));
+    ASSERT_NO_FATAL_FAILURE(checkStride(int64_t{1} << 30, false));
+    ASSERT_NO_FATAL_FAILURE(checkStride(int64_t{1} << 31, true));
+    ASSERT_NO_FATAL_FAILURE(checkStride(int64_t{1} << 31, false));
+    EXPECT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+TEST(OpGammaContrast, ada_planar_u8_tensor_launch)
+{
+    int device = 0;
+    ASSERT_EQ(cudaSuccess, cudaGetDevice(&device));
+    cudaDeviceProp properties{};
+    ASSERT_EQ(cudaSuccess, cudaGetDeviceProperties(&properties, device));
+    if (properties.major != 8 || properties.minor != 9)
+    {
+        GTEST_SKIP() << "Requires SM89";
+    }
+
+    nvcv::Tensor src = nvcv::util::CreateTensor(2, 4096, 8, nvcv::FMT_RGB8p);
+    nvcv::Tensor dst = nvcv::util::CreateTensor(2, 4096, 8, nvcv::FMT_RGB8p);
+    nvcv::Tensor gamma({{6}, "N"}, nvcv::TYPE_F32);
+    auto         srcData   = src.exportData<nvcv::TensorDataStridedCuda>();
+    auto         gammaData = gamma.exportData<nvcv::TensorDataStridedCuda>();
+    ASSERT_TRUE(srcData && gammaData);
+    nvcv::util::SetTensorTo<uint8_t>(*srcData, 128);
+    nvcv::util::SetTensorTo<float>(*gammaData, 0.75f);
+    cudaStream_t stream{};
+    ASSERT_EQ(cudaSuccess, cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    cvcuda::GammaContrast op(2, 3);
+    ASSERT_NO_THROW(op(stream, src, dst, gamma));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+    ASSERT_EQ(cudaSuccess, cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+    EXPECT_NO_THROW(op(stream, src, dst, gamma));
+    cudaGraph_t graph{};
+    ASSERT_EQ(cudaSuccess, cudaStreamEndCapture(stream, &graph));
+    size_t nodeCount = 0;
+    ASSERT_EQ(cudaSuccess, cudaGraphGetNodes(graph, nullptr, &nodeCount));
+    std::vector<cudaGraphNode_t> nodes(nodeCount);
+    ASSERT_EQ(cudaSuccess, cudaGraphGetNodes(graph, nodes.data(), &nodeCount));
+    int imageKernels = 0;
+    for (cudaGraphNode_t node : nodes)
+    {
+        cudaGraphNodeType type{};
+        ASSERT_EQ(cudaSuccess, cudaGraphNodeGetType(node, &type));
+        if (type != cudaGraphNodeTypeKernel)
+        {
+            continue;
+        }
+        CUDA_KERNEL_NODE_PARAMS parameters{};
+        ASSERT_EQ(CUDA_SUCCESS, cuGraphKernelNodeGetParams(node, &parameters));
+        if (parameters.blockDimY == 8)
+        {
+            ++imageKernels;
+            EXPECT_EQ(32u, parameters.blockDimX);
+            EXPECT_EQ(16u, parameters.gridDimX);
+            EXPECT_EQ(1u, parameters.gridDimY);
+            EXPECT_EQ(2u, parameters.gridDimZ);
+        }
+    }
+    EXPECT_EQ(1, imageKernels);
+    EXPECT_EQ(cudaSuccess, cudaGraphDestroy(graph));
+    EXPECT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
 
 static int ScaledSize(int size, double scale)
 {
@@ -157,8 +308,23 @@ void GammaContrastVarShapeCpuOpWrapper(std::vector<uint8_t> &hDst, int dstRowStr
     }
     else
     {
-        GammaContrastVarShapeCpuOp(hDst, dstRowStride, dstSize, hSrc, srcRowStride, srcSize, fmt, gamma, imageIndex,
-                                   perChannel);
+        if (nvcvDataType == NVCV_DATA_TYPE_U16 || nvcvDataType == NVCV_DATA_TYPE_2U16
+            || nvcvDataType == NVCV_DATA_TYPE_3U16 || nvcvDataType == NVCV_DATA_TYPE_4U16)
+        {
+            std::vector<uint16_t> src_tmp(hSrc.size() / sizeof(uint16_t));
+            std::vector<uint16_t> dst_tmp(hDst.size() / sizeof(uint16_t));
+            size_t                copySize = hSrc.size();
+            memcpy(static_cast<void *>(src_tmp.data()), static_cast<const void *>(hSrc.data()), copySize);
+            memcpy(static_cast<void *>(dst_tmp.data()), static_cast<void *>(hDst.data()), copySize);
+            GammaContrastVarShapeCpuOp(dst_tmp, dstRowStride / sizeof(uint16_t), dstSize, src_tmp,
+                                       srcRowStride / sizeof(uint16_t), srcSize, fmt, gamma, imageIndex, perChannel);
+            memcpy(static_cast<void *>(hDst.data()), static_cast<void *>(dst_tmp.data()), copySize);
+        }
+        else
+        {
+            GammaContrastVarShapeCpuOp(hDst, dstRowStride, dstSize, hSrc, srcRowStride, srcSize, fmt, gamma, imageIndex,
+                                       perChannel);
+        }
     }
 }
 
@@ -183,6 +349,7 @@ NVCV_TEST_SUITE_P(OpGammaContrast, test::ValueList<int, int, int, NVCVImageForma
     {   11,    11,       4,   NVCV_IMAGE_FORMAT_RGBA8,        0.4,      false},
     {   7,      8,       3,    NVCV_IMAGE_FORMAT_RGB8,        0.9,      false},
     {   7,      6,       4,   NVCV_IMAGE_FORMAT_RGBA8,        0.8,      false},
+    {  17,      9,       2,     NVCV_IMAGE_FORMAT_U16,        1.2,      false},
 
     {   5,      5,       1,     NVCV_IMAGE_FORMAT_F32,       0.5,        true},
     {   9,     11,       2,     NVCV_IMAGE_FORMAT_F32,      0.75,        true},
@@ -197,6 +364,13 @@ NVCV_TEST_SUITE_P(OpGammaContrast, test::ValueList<int, int, int, NVCVImageForma
     {   11,    11,       4, NVCV_IMAGE_FORMAT_RGBAf32,        0.4,      false},
     {   7,      8,       3,  NVCV_IMAGE_FORMAT_RGBf32,        0.9,      false},
     {   7,      6,       4, NVCV_IMAGE_FORMAT_RGBAf32,        0.8,      false},
+
+    // F16 rows follow the float path (pow, no /255, clamp to [0, 1]) with an FP32-computed gold.
+    {   5,      5,       1,     NVCV_IMAGE_FORMAT_F16,        0.5,       true},
+    {   12,     7,       3,  NVCV_IMAGE_FORMAT_RGBf16,        0.9,       true},
+    {   11,    11,       4, NVCV_IMAGE_FORMAT_RGBAf16,        0.4,       true},
+    {   9,     11,       2,     NVCV_IMAGE_FORMAT_F16,       0.75,      false},
+    {   7,      6,       4, NVCV_IMAGE_FORMAT_RGBAf16,        0.8,      false},
 });
 
 // clang-format on
@@ -216,6 +390,7 @@ TEST_P(OpGammaContrast, varshape_correct_output)
     ASSERT_EQ(NVCV_SUCCESS, nvcvImageFormatGetPlaneDataType(static_cast<NVCVImageFormat>(format), 0, &nvcvDataType));
     float gamma       = GetParamValue<4>();
     bool  isFloatTest = false;
+    bool  isHalfTest  = false;
 
     bool perChannel = GetParamValue<5>();
 
@@ -251,6 +426,18 @@ TEST_P(OpGammaContrast, varshape_correct_output)
             for (size_t idx = 0; idx < (srcVec[i].size() / sizeof(float)); ++idx)
             {
                 reinterpret_cast<float *>(srcVec[i].data())[idx] = udistf(rng);
+            }
+            break;
+        case NVCV_DATA_TYPE_F16:
+        case NVCV_DATA_TYPE_2F16:
+        case NVCV_DATA_TYPE_3F16:
+        case NVCV_DATA_TYPE_4F16:
+            // Same [0, 1] range as the float rows, quantized to half so the FP32 gold consumes
+            // exactly the values the kernel reads.
+            isHalfTest = true;
+            for (size_t idx = 0; idx < (srcVec[i].size() / sizeof(__half)); ++idx)
+            {
+                reinterpret_cast<__half *>(srcVec[i].data())[idx] = __float2half(udistf(rng));
             }
             break;
         default:
@@ -343,6 +530,21 @@ TEST_P(OpGammaContrast, varshape_correct_output)
                                dstRowStride, // vec has no padding
                                dstHeight, cudaMemcpyDeviceToHost));
 
+        if (isHalfTest)
+        {
+            // F16 gold: run the FP32 reference (pow, clamp to [0, 1]) on the widened half input.
+            // Bit-exactness against the FP32 gold is not applicable to the half output; pow is a
+            // transcendental chain, so per the HalfTestUtils.hpp policy the bound is kUlps = 8
+            // half-ULPs at the reference magnitude.
+            std::vector<float> srcF = test::HalfBytesToFloat(srcVec[i]);
+            std::vector<float> goldF(srcF.size());
+            GammaContrastVarShapeCpuOp(goldF, dstRowStride / static_cast<int>(sizeof(__half)), {dstWidth, dstHeight},
+                                       srcF, srcRowStride / static_cast<int>(sizeof(__half)), {srcWidth, srcHeight},
+                                       format, gammaVec, i, perChannel);
+            test::ExpectNearHalfUlps(goldF, test::HalfBytesToFloat(testVec), 8.f);
+            continue;
+        }
+
         std::vector<uint8_t> goldVec(dstHeight * dstRowStride);
         std::ranges::generate(goldVec, []() { return 0; });
 
@@ -373,7 +575,7 @@ NVCV_TEST_SUITE_P(OpGammaContrast_Negative, test::ValueList<int, nvcv::ImageForm
     {6, nvcv::FMT_U8, nvcv::FMT_U8}, // larger than max batches
     {2, nvcv::FMT_RGBA8, nvcv::FMT_RGBA8}, // larger than max channels
     {2, nvcv::FMT_RGB8p, nvcv::FMT_RGB8}, // input/output format mismatch (planar in, interleaved out)
-    {2, nvcv::FMT_RGBf16, nvcv::FMT_RGBf16},
+    {2, nvcv::FMT_F64, nvcv::FMT_F64}, // unsupported data type (64-bit float; F16 is now valid)
     {2, nvcv::FMT_U8, nvcv::FMT_S8},
 });
 
@@ -518,6 +720,58 @@ TEST(OpGammaContrast_Negative, gamma_length_must_match_batch_or_batch_channels)
 
     EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT,
               nvcv::ProtectCall([&] { gammacontrastOp(stream, batchSrc, batchDst, gammaTensor); }));
+
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+TEST(OpGammaContrast_Negative, gamma_tensor_must_be_float32)
+{
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+
+    constexpr int samples = 2;
+    constexpr int width   = 8;
+    constexpr int height  = 8;
+
+    nvcv::Tensor input  = nvcv::util::CreateTensor(samples, width, height, nvcv::FMT_RGB8);
+    nvcv::Tensor output = nvcv::util::CreateTensor(samples, width, height, nvcv::FMT_RGB8);
+    nvcv::Tensor gammas({{samples}, "N"}, nvcv::TYPE_U8);
+
+    cvcuda::GammaContrast gammacontrastOp(samples, 3);
+
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT, nvcv::ProtectCall([&] { gammacontrastOp(stream, input, output, gammas); }));
+
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+TEST(OpGammaContrast_Negative, varshape_gamma_tensor_must_be_float32)
+{
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+
+    constexpr int samples = 2;
+    constexpr int width   = 8;
+    constexpr int height  = 8;
+
+    std::vector<nvcv::Image> inputImages;
+    std::vector<nvcv::Image> outputImages;
+    for (int i = 0; i < samples; ++i)
+    {
+        inputImages.emplace_back(nvcv::Size2D{width, height}, nvcv::FMT_RGB8);
+        outputImages.emplace_back(nvcv::Size2D{width, height}, nvcv::FMT_RGB8);
+    }
+
+    nvcv::ImageBatchVarShape input(samples);
+    input.pushBack(inputImages.begin(), inputImages.end());
+    nvcv::ImageBatchVarShape output(samples);
+    output.pushBack(outputImages.begin(), outputImages.end());
+    nvcv::Tensor gammas({{samples}, "N"}, nvcv::TYPE_U8);
+
+    cvcuda::GammaContrast gammacontrastOp(samples, 3);
+
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT, nvcv::ProtectCall([&] { gammacontrastOp(stream, input, output, gammas); }));
 
     ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
     ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
@@ -714,6 +968,12 @@ TEST(OpGammaContrast_Negative, create_rejects_non_positive_max_batch_or_channels
 // the interleaved output bit-for-bit. Scaffolding lives in PlanarParityUtils.hpp.
 namespace {
 
+const nvcv::ImageFormat FMT_RGBU16{nvcv::ColorModel::RGB,    nvcv::CSPEC_UNDEFINED, nvcv::MemLayout::PITCH_LINEAR,
+                                   nvcv::DataKind::UNSIGNED, nvcv::Swizzle::S_XYZ1, nvcv::Packing::X16_Y16_Z16};
+const nvcv::ImageFormat FMT_RGBU16p{nvcv::ColorModel::RGB,    nvcv::CSPEC_UNDEFINED, nvcv::MemLayout::PITCH_LINEAR,
+                                    nvcv::DataKind::UNSIGNED, nvcv::Swizzle::S_XYZ0, nvcv::Packing::X16,
+                                    nvcv::Packing::X16,       nvcv::Packing::X16};
+
 float DeterministicGammaValue(size_t idx, float minValue, float maxValue, int salt)
 {
     const int bucket = (static_cast<int>(idx) * 37 + salt) % 101;
@@ -735,6 +995,7 @@ struct TensorTestData
 {
     NVCVDataType                      dataType;
     bool                              isFloat;
+    bool                              isHalf;
     int                               rowStride;
     size_t                            sampleBytes;
     std::vector<std::vector<uint8_t>> hostSamples;
@@ -752,6 +1013,8 @@ void UploadDeterministicTensorInput(nvcv::Tensor &tensor, int samples, int width
               nvcvImageFormatGetPlaneDataType(static_cast<NVCVImageFormat>(format), 0, &testData.dataType));
     testData.isFloat = testData.dataType == NVCV_DATA_TYPE_F32 || testData.dataType == NVCV_DATA_TYPE_2F32
                     || testData.dataType == NVCV_DATA_TYPE_3F32 || testData.dataType == NVCV_DATA_TYPE_4F32;
+    testData.isHalf = testData.dataType == NVCV_DATA_TYPE_F16 || testData.dataType == NVCV_DATA_TYPE_2F16
+                   || testData.dataType == NVCV_DATA_TYPE_3F16 || testData.dataType == NVCV_DATA_TYPE_4F16;
     const int bytesPerElement = format.planePixelStrideBytes(0) / format.numChannels();
     testData.rowStride        = width * format.numChannels() * bytesPerElement;
     testData.sampleBytes      = static_cast<size_t>(testData.rowStride) * height;
@@ -766,6 +1029,16 @@ void UploadDeterministicTensorInput(nvcv::Tensor &tensor, int samples, int width
             for (size_t i = 0; i < testData.sampleBytes / sizeof(float); ++i)
             {
                 values[i] = DeterministicUnitValue(i, sample);
+            }
+        }
+        else if (testData.isHalf)
+        {
+            // Same unit-range values as float, quantized to half so the FP32 gold consumes
+            // exactly the values the kernel reads.
+            auto *values = reinterpret_cast<__half *>(hostSample.data());
+            for (size_t i = 0; i < testData.sampleBytes / sizeof(__half); ++i)
+            {
+                values[i] = __float2half(DeterministicUnitValue(i, sample));
             }
         }
         else
@@ -852,6 +1125,59 @@ void RunGammaContrastPlanarParityCase(nvcv::ImageFormat planarFmt, nvcv::ImageFo
         });
 }
 
+void RunGammaContrastPaddedPerChannelGammaParity()
+{
+    constexpr int     numImages     = 2;
+    constexpr int     channels      = 3;
+    constexpr int64_t sampleStride  = sizeof(float);
+    constexpr int64_t channelStride = 3 * sizeof(float);
+    constexpr size_t  bufferSize    = channels * channelStride;
+
+    const std::array<std::array<float, channels>, numImages> gammaValues{
+        std::array<float, channels>{0.6f, 0.9f, 1.2f},
+         std::array<float, channels>{1.5f, 1.8f, 2.1f}
+    };
+    std::vector<uint8_t> paddedGamma(bufferSize, 0);
+    for (int channel = 0; channel < channels; ++channel)
+    {
+        for (int image = 0; image < numImages; ++image)
+        {
+            std::memcpy(paddedGamma.data() + channel * channelStride + image * sampleStride,
+                        &gammaValues[image][channel], sizeof(float));
+        }
+    }
+
+    NVCVByte *allocation{};
+    ASSERT_EQ(cudaSuccess, cudaMalloc(reinterpret_cast<void **>(&allocation), bufferSize));
+    if (allocation == nullptr)
+    {
+        return;
+    }
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(allocation, paddedGamma.data(), bufferSize, cudaMemcpyHostToDevice));
+
+    nvcv::TensorDataStridedCuda::Buffer buffer{};
+    buffer.basePtr           = allocation;
+    buffer.strides[0]        = channelStride;
+    buffer.strides[1]        = sampleStride;
+    nvcv::Tensor gammaTensor = nvcv::TensorWrapData(
+        nvcv::TensorDataStridedCuda{
+            nvcv::TensorShape{{channels, numImages}, "CN"},
+            nvcv::TYPE_F32, buffer
+    },
+        nvcv::TensorDataCleanupCallback{[allocation](const nvcv::TensorData &)
+                                        {
+                                            cudaFree(allocation);
+                                        }});
+
+    test::planar::RunVarShapeParity(nvcv::FMT_RGB8p, nvcv::FMT_RGB8, 37, 23, 37, 23, numImages,
+                                    [&gammaTensor](cudaStream_t stream, const nvcv::ImageBatchVarShape &src,
+                                                   const nvcv::ImageBatchVarShape &dst, nvcv::ImageFormat)
+                                    {
+                                        cvcuda::GammaContrast op(numImages, channels);
+                                        EXPECT_NO_THROW(op(stream, src, dst, gammaTensor));
+                                    });
+}
+
 } // namespace
 
 // Parameters: width, height, numImages, perChannelGamma, planarFmt, interleavedFmt
@@ -861,8 +1187,12 @@ NVCV_TEST_SUITE_P(OpGammaContrastPlanar,
     {176, 113, 2, false,    nvcv::FMT_RGB8p,    nvcv::FMT_RGB8}, // RGB8, per-image gamma
     {123,  66, 2,  true,    nvcv::FMT_RGB8p,    nvcv::FMT_RGB8}, // RGB8, per-channel gamma
     { 64,  48, 1,  true,   nvcv::FMT_RGBA8p,   nvcv::FMT_RGBA8}, // RGBA8, per-channel gamma
+    { 41,  33, 2, false,          FMT_RGBU16p,          FMT_RGBU16}, // RGB16, per-image gamma
     { 50,  40, 2, false,  nvcv::FMT_RGBf32p,  nvcv::FMT_RGBf32}, // RGBf32, per-image gamma
     { 72,  54, 2,  true, nvcv::FMT_RGBAf32p, nvcv::FMT_RGBAf32}, // RGBAf32, per-channel gamma
+    // F16 parity is bit-exact: both layouts run the same float chain and round to half once.
+    { 50,  40, 2, false,  nvcv::FMT_RGBf16p,  nvcv::FMT_RGBf16}, // RGBf16, per-image gamma
+    { 72,  54, 2,  true, nvcv::FMT_RGBAf16p, nvcv::FMT_RGBAf16}, // RGBAf16, per-channel gamma
 });
 
 // clang-format on
@@ -871,6 +1201,136 @@ TEST_P(OpGammaContrastPlanar, varshape_matches_interleaved)
 {
     RunGammaContrastPlanarParityCase(GetParamValue<4>(), GetParamValue<5>(), GetParamValue<0>(), GetParamValue<1>(),
                                      GetParamValue<2>(), GetParamValue<3>());
+}
+
+TEST(OpGammaContrastPlanar, padded_per_channel_gamma_matches_interleaved)
+{
+    RunGammaContrastPaddedPerChannelGammaParity();
+}
+
+TEST(OpGammaContrastPlanar, strided_per_image_gamma_matches_interleaved)
+{
+    constexpr int     numImages    = 2;
+    constexpr int     channels     = 3;
+    constexpr int64_t sampleStride = 2 * sizeof(float);
+    constexpr size_t  bufferSize   = numImages * sampleStride;
+
+    const std::array<float, numImages> gammaValues{0.6f, 1.4f};
+    std::vector<uint8_t>               paddedGamma(bufferSize, 0);
+    for (int image = 0; image < numImages; ++image)
+    {
+        std::memcpy(paddedGamma.data() + image * sampleStride, &gammaValues[image], sizeof(float));
+    }
+
+    NVCVByte *allocation{};
+    ASSERT_EQ(cudaSuccess, cudaMalloc(reinterpret_cast<void **>(&allocation), bufferSize));
+    if (allocation == nullptr)
+    {
+        return;
+    }
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(allocation, paddedGamma.data(), bufferSize, cudaMemcpyHostToDevice));
+
+    nvcv::TensorDataStridedCuda::Buffer buffer{};
+    buffer.basePtr           = allocation;
+    buffer.strides[0]        = sampleStride;
+    buffer.strides[1]        = sizeof(float);
+    buffer.strides[2]        = sizeof(float);
+    nvcv::Tensor gammaTensor = nvcv::TensorWrapData(
+        nvcv::TensorDataStridedCuda{
+            nvcv::TensorShape{{numImages, 1, 1}, "NWC"},
+            nvcv::TYPE_F32, buffer
+    },
+        nvcv::TensorDataCleanupCallback{[allocation](const nvcv::TensorData &)
+                                        {
+                                            cudaFree(allocation);
+                                        }});
+
+    test::planar::RunVarShapeParity(nvcv::FMT_RGB8p, nvcv::FMT_RGB8, 37, 23, 37, 23, numImages,
+                                    [&gammaTensor](cudaStream_t stream, const nvcv::ImageBatchVarShape &src,
+                                                   const nvcv::ImageBatchVarShape &dst, nvcv::ImageFormat)
+                                    {
+                                        cvcuda::GammaContrast op(numImages, channels);
+                                        EXPECT_NO_THROW(op(stream, src, dst, gammaTensor));
+                                    });
+}
+
+TEST(OpGammaContrastPlanar, rank2_unlabeled_strided_per_channel_gamma_matches_interleaved)
+{
+    constexpr int     numImages     = 2;
+    constexpr int     channels      = 3;
+    constexpr int64_t sampleStride  = 4 * sizeof(float);
+    constexpr int64_t channelStride = sizeof(float);
+    constexpr size_t  bufferSize    = (numImages - 1) * sampleStride + channels * channelStride;
+
+    const std::array<std::array<float, channels>, numImages> gammaValues{
+        std::array<float, channels>{0.6f, 0.9f, 1.2f},
+         std::array<float, channels>{1.5f, 1.8f, 2.1f}
+    };
+    std::vector<uint8_t> paddedGamma(bufferSize, 0);
+    for (int image = 0; image < numImages; ++image)
+    {
+        for (int channel = 0; channel < channels; ++channel)
+        {
+            std::memcpy(paddedGamma.data() + image * sampleStride + channel * channelStride,
+                        &gammaValues[image][channel], sizeof(float));
+        }
+    }
+
+    NVCVByte *allocation{};
+    ASSERT_EQ(cudaSuccess, cudaMalloc(reinterpret_cast<void **>(&allocation), bufferSize));
+    if (allocation == nullptr)
+    {
+        return;
+    }
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(allocation, paddedGamma.data(), bufferSize, cudaMemcpyHostToDevice));
+
+    nvcv::TensorDataStridedCuda::Buffer buffer{};
+    buffer.basePtr           = allocation;
+    buffer.strides[0]        = sampleStride;
+    buffer.strides[1]        = channelStride;
+    nvcv::Tensor gammaTensor = nvcv::TensorWrapData(
+        nvcv::TensorDataStridedCuda{
+            nvcv::TensorShape{{numImages, channels}, "HW"},
+            nvcv::TYPE_F32, buffer
+    },
+        nvcv::TensorDataCleanupCallback{[allocation](const nvcv::TensorData &)
+                                        {
+                                            cudaFree(allocation);
+                                        }});
+
+    test::planar::RunTensorParity(
+        nvcv::FMT_RGB8p, nvcv::FMT_RGB8, 37, 23, 37, 23, numImages,
+        [&gammaTensor](cudaStream_t stream, const nvcv::Tensor &src, const nvcv::Tensor &dst, nvcv::ImageFormat)
+        {
+            cvcuda::GammaContrast op(numImages, channels);
+            EXPECT_NO_THROW(op(stream, src, dst, gammaTensor));
+        });
+}
+
+TEST(OpGammaContrastPlanar, u8_vector_tail_matches_interleaved)
+{
+    RunGammaContrastPlanarParityCase(nvcv::FMT_RGB8p, nvcv::FMT_RGB8, 65, 9, 1, true);
+}
+
+TEST(OpGammaContrastPlanar, f32_ragged_widths_matches_interleaved)
+{
+    constexpr int numImages = 2;
+    constexpr int channels  = 3;
+
+    nvcv::Tensor gammaTensor({{numImages * channels}, "N"}, nvcv::TYPE_F32);
+    ASSERT_NO_FATAL_FAILURE(UploadGammaTensor(gammaTensor, std::vector<float>{0.6f, 0.9f, 1.2f, 1.5f, 1.8f, 2.1f}));
+
+    const std::vector<nvcv::Size2D> sizes{
+        {33, 9},
+        {17, 5}
+    };
+    test::planar::RunVarShapeParity(nvcv::FMT_RGBf32p, nvcv::FMT_RGBf32, sizes, sizes,
+                                    [&gammaTensor](cudaStream_t stream, const nvcv::ImageBatchVarShape &src,
+                                                   const nvcv::ImageBatchVarShape &dst, nvcv::ImageFormat)
+                                    {
+                                        cvcuda::GammaContrast op(numImages, channels);
+                                        EXPECT_NO_THROW(op(stream, src, dst, gammaTensor));
+                                    });
 }
 
 // ---------------------------------------------------------------------------
@@ -911,9 +1371,17 @@ NVCV_TEST_SUITE_P(OpGammaContrastTensorPlanar,
                   test::ValueList<int, int, int, bool, nvcv::ImageFormat, nvcv::ImageFormat>{
     {176, 113, 2, false,    nvcv::FMT_RGB8p,    nvcv::FMT_RGB8},
     {123,  66, 2,  true,    nvcv::FMT_RGB8p,    nvcv::FMT_RGB8},
+    // These widths leave partial 16-byte carriers, exercising lookup tails in both layouts.
+    {1921,  5, 2,  true,    nvcv::FMT_RGB8p,    nvcv::FMT_RGB8},
+    {1913,  3, 1,  true,   nvcv::FMT_RGBA8p,   nvcv::FMT_RGBA8},
+    {  17, 13, 2,  true,    nvcv::FMT_RGB8p,    nvcv::FMT_RGB8},
     { 64,  48, 1,  true,   nvcv::FMT_RGBA8p,   nvcv::FMT_RGBA8},
+    { 41,  33, 2, false,          FMT_RGBU16p,          FMT_RGBU16},
     { 50,  40, 3, false,  nvcv::FMT_RGBf32p,  nvcv::FMT_RGBf32},
     { 72,  54, 2,  true, nvcv::FMT_RGBAf32p, nvcv::FMT_RGBAf32},
+    // F16 parity is bit-exact: both layouts run the same float chain and round to half once.
+    { 50,  40, 3, false,  nvcv::FMT_RGBf16p,  nvcv::FMT_RGBf16},
+    { 72,  54, 2,  true, nvcv::FMT_RGBAf16p, nvcv::FMT_RGBAf16},
 });
 
 // clang-format on
@@ -924,6 +1392,24 @@ TEST_P(OpGammaContrastTensorPlanar, tensor_matches_interleaved)
                                            GetParamValue<1>(), GetParamValue<2>(), GetParamValue<3>());
 }
 
+TEST(OpGammaContrastTensorPlanar, signed16_single_channel_matches_interleaved)
+{
+    constexpr int samples = 2;
+    constexpr int width   = 37;
+    constexpr int height  = 19;
+
+    nvcv::Tensor gammaTensor({{samples}, "N"}, nvcv::TYPE_F32);
+    ASSERT_NO_FATAL_FAILURE(UploadGammaTensor(gammaTensor, std::vector<float>{1.0f, 2.0f}));
+
+    test::planar::RunTensorSingleChannelLayoutParity(
+        width, height, width, height, samples, nvcv::TYPE_S16,
+        [&gammaTensor](cudaStream_t stream, const nvcv::Tensor &src, const nvcv::Tensor &dst)
+        {
+            cvcuda::GammaContrast op(samples, 1);
+            EXPECT_NO_THROW(op(stream, src, dst, gammaTensor));
+        });
+}
+
 // Tensor interleaved (NHWC) correctness against an independent CPU gold (the same gold the var-shape
 // path is validated with), exercising the tensor kernel directly.
 // width, height, numSamples, format, perChannelGamma
@@ -932,10 +1418,18 @@ NVCV_TEST_SUITE_P(OpGammaContrastTensor,
                   test::ValueList<int, int, int, NVCVImageFormat, bool>{
     {  9, 11, 2,    NVCV_IMAGE_FORMAT_U8,  true},
     { 12,  7, 3,  NVCV_IMAGE_FORMAT_RGB8,  true},
+    // These widths exercise lookup tails and row boundaries.
+    {1921,  5, 2,  NVCV_IMAGE_FORMAT_RGB8,  true},
+    {4097,  3, 1,    NVCV_IMAGE_FORMAT_U8,  true},
+    {  31,  7, 2, NVCV_IMAGE_FORMAT_RGBA8,  true},
     { 11, 11, 2, NVCV_IMAGE_FORMAT_RGBA8, false},
     {  7,  9, 2, NVCV_IMAGE_FORMAT_RGBA8,  true},
     {  8,  6, 2, NVCV_IMAGE_FORMAT_RGBf32, true},
     {  9,  7, 2, NVCV_IMAGE_FORMAT_RGBAf32, true},
+    // F16 rows are validated against an FP32 gold within 8 half-ULPs (see the F16 gold branch).
+    {  9, 11, 2,     NVCV_IMAGE_FORMAT_F16, false},
+    {  8,  6, 2,  NVCV_IMAGE_FORMAT_RGBf16, true},
+    {  9,  7, 2, NVCV_IMAGE_FORMAT_RGBAf16, true},
 });
 
 // clang-format on
@@ -977,6 +1471,18 @@ TEST_P(OpGammaContrastTensor, correct_output)
         std::vector<uint8_t> got;
         std::vector<uint8_t> gold = testData.hostSamples[n];
         ASSERT_NO_FATAL_FAILURE(DownloadTensorSample(dst, n, testData.rowStride, height, got));
+        if (testData.isHalf)
+        {
+            // F16 gold: FP32 reference (pow, clamp to [0, 1]) on the widened half input, bounded
+            // by 8 half-ULPs -- pow is a transcendental chain per the HalfTestUtils.hpp policy.
+            std::vector<float> srcF = test::HalfBytesToFloat(testData.hostSamples[n]);
+            std::vector<float> goldF(srcF.size());
+            GammaContrastVarShapeCpuOp(goldF, testData.rowStride / static_cast<int>(sizeof(__half)), {width, height},
+                                       srcF, testData.rowStride / static_cast<int>(sizeof(__half)), {width, height},
+                                       fmt, gammaVec, n, perCh);
+            test::ExpectNearHalfUlps(goldF, test::HalfBytesToFloat(got), 8.f);
+            continue;
+        }
         GammaContrastVarShapeCpuOpWrapper(gold, testData.rowStride, {width, height}, testData.hostSamples[n],
                                           testData.rowStride, {width, height}, fmt, gammaVec, n, perCh,
                                           testData.dataType);
@@ -1048,8 +1554,11 @@ NVCV_TEST_SUITE_P(OpGammaContrastTensorScalarPlanar,
     {176, 113, 2, 0.75f, 1.0f,    nvcv::FMT_RGB8p,    nvcv::FMT_RGB8,  NVCV_ROUND_NEAREST},
     {123,  66, 2, 1.50f, 0.9f,    nvcv::FMT_RGB8p,    nvcv::FMT_RGB8, NVCV_ROUND_TRUNCATE},
     { 64,  48, 1, 0.50f, 0.8f,   nvcv::FMT_RGBA8p,   nvcv::FMT_RGBA8,  NVCV_ROUND_NEAREST},
+    { 41,  33, 2, 1.20f, 1.0f,        FMT_RGBU16p,        FMT_RGBU16,  NVCV_ROUND_NEAREST},
     { 50,  40, 3, 2.00f, 1.0f,  nvcv::FMT_RGBf32p,  nvcv::FMT_RGBf32, NVCV_ROUND_TRUNCATE},
     { 72,  54, 2, 0.70f, 1.2f, nvcv::FMT_RGBAf32p, nvcv::FMT_RGBAf32,  NVCV_ROUND_NEAREST},
+    // F16 parity is bit-exact: both layouts run the same float chain and round to half once.
+    { 50,  40, 2, 0.75f, 1.1f,  nvcv::FMT_RGBf16p,  nvcv::FMT_RGBf16,  NVCV_ROUND_NEAREST},
 });
 
 // clang-format on
@@ -1071,6 +1580,9 @@ NVCV_TEST_SUITE_P(OpGammaContrastTensorScalar,
     { 11, 11, 2,   NVCV_IMAGE_FORMAT_RGBA8, 0.80f, 1.0f,  NVCV_ROUND_NEAREST},
     {  8,  6, 2,  NVCV_IMAGE_FORMAT_RGBf32, 2.00f, 1.0f, NVCV_ROUND_TRUNCATE},
     { 10,  5, 2, NVCV_IMAGE_FORMAT_RGBAf32, 0.70f, 1.2f,  NVCV_ROUND_NEAREST},
+    // F16 rows are validated against an FP32 gold within 8 half-ULPs; round mode does not apply
+    // to the float path.
+    {  8,  6, 2,  NVCV_IMAGE_FORMAT_RGBf16, 0.75f, 1.1f,  NVCV_ROUND_NEAREST},
 });
 
 // clang-format on
@@ -1104,6 +1616,20 @@ TEST_P(OpGammaContrastTensorScalar, matches_cpu_gold)
         std::vector<uint8_t> got;
         std::vector<uint8_t> gold(testData.sampleBytes);
         ASSERT_NO_FATAL_FAILURE(DownloadTensorSample(dst, n, testData.rowStride, height, got));
+        if (testData.isHalf)
+        {
+            // F16 gold: FP32 reference (gain * in**gamma, clamp to [0, 1]) on the widened half
+            // input, bounded by 8 half-ULPs -- pow is a transcendental chain per the
+            // HalfTestUtils.hpp policy. Round mode does not apply to the float path.
+            std::vector<float> srcF = test::HalfBytesToFloat(testData.hostSamples[n]);
+            std::vector<float> goldF(srcF.size());
+            for (size_t i = 0; i < srcF.size(); ++i)
+            {
+                goldF[i] = nvcv::cuda::clamp(gain * std::pow(srcF[i], gamma), 0.f, 1.f);
+            }
+            test::ExpectNearHalfUlps(goldF, test::HalfBytesToFloat(got), 8.f);
+            continue;
+        }
         GammaContrastScalarCpuGold(gold, testData.hostSamples[n], gamma, gain, testData.isFloat, roundMode);
         ExpectTensorNear(got, gold, testData.isFloat);
     }
@@ -1158,12 +1684,17 @@ NVCV_TEST_SUITE_P(OpGammaContrastScalarVsTensor,
                   test::ValueList<int, int, int, NVCVImageFormat, float>{
     {  9, 11, 2,      NVCV_IMAGE_FORMAT_U8, 0.60f},
     { 12,  7, 3,    NVCV_IMAGE_FORMAT_RGB8, 1.40f},
+    // These widths exercise lookup tails through the scalar-gamma entry point.
+    {1921,  5, 2,    NVCV_IMAGE_FORMAT_RGB8, 0.70f},
+    {1913,  3, 1,   NVCV_IMAGE_FORMAT_RGBA8, 1.30f},
+    {4097,  2, 2,      NVCV_IMAGE_FORMAT_U8, 0.85f},
     { 11, 11, 2,   NVCV_IMAGE_FORMAT_RGBA8, 0.80f},
     { 10,  9, 2,      NVCV_IMAGE_FORMAT_U16, 1.20f},
     {  7,  8, 2,      NVCV_IMAGE_FORMAT_S16, 0.90f},
     {  8,  6, 2,      NVCV_IMAGE_FORMAT_S32, 1.10f},
     {  8,  6, 2,  NVCV_IMAGE_FORMAT_RGBf32, 0.70f},
     { 10,  5, 2, NVCV_IMAGE_FORMAT_RGBAf32, 1.30f},
+    {  8,  6, 2,  NVCV_IMAGE_FORMAT_RGBf16, 0.70f},
 });
 
 // clang-format on
@@ -1212,5 +1743,179 @@ TEST_P(OpGammaContrastScalarVsTensor, bit_exact_gain1)
         ASSERT_NO_FATAL_FAILURE(compareSample(n));
     }
 
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+// Mismatched stream partitions once compacted output; CPU gold prevents a shared layout fault from masking it.
+TEST(OpGammaContrastTensorScalarPlanar, packed_source_with_padded_destination_matches_gold)
+{
+    constexpr int   kSamples     = 2;
+    constexpr int   kChannels    = 3;
+    constexpr int   kHeight      = 16;
+    constexpr int   kWidth       = 23;
+    constexpr int   kSrcRowPitch = kWidth;
+    constexpr int   kDstRowPitch = 32; // Matches allocator padding for a 23-byte row.
+    constexpr float kGamma       = 0.5f;
+    constexpr float kGain        = 1.0f;
+
+    const int64_t srcBytes = int64_t{kSamples} * kChannels * kHeight * kSrcRowPitch;
+    const int64_t dstBytes = int64_t{kSamples} * kChannels * kHeight * kDstRowPitch;
+
+    std::vector<uint8_t> hostSrc(static_cast<size_t>(srcBytes));
+    for (size_t i = 0; i < hostSrc.size(); ++i) hostSrc[i] = static_cast<uint8_t>((i * 37 + 11) % 256);
+
+    NVCVByte *srcAlloc{};
+    NVCVByte *dstAlloc{};
+    ASSERT_EQ(cudaSuccess, cudaMalloc(reinterpret_cast<void **>(&srcAlloc), srcBytes));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(reinterpret_cast<void **>(&dstAlloc), dstBytes));
+    ASSERT_EQ(cudaSuccess, cudaMemset(dstAlloc, 0, dstBytes));
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(srcAlloc, hostSrc.data(), srcBytes, cudaMemcpyHostToDevice));
+
+    nvcv::TensorDataStridedCuda::Buffer srcBuffer{};
+    srcBuffer.basePtr    = srcAlloc;
+    srcBuffer.strides[3] = 1;
+    srcBuffer.strides[2] = kSrcRowPitch;
+    srcBuffer.strides[1] = int64_t{kHeight} * kSrcRowPitch;
+    srcBuffer.strides[0] = int64_t{kChannels} * kHeight * kSrcRowPitch;
+
+    nvcv::TensorDataStridedCuda::Buffer dstBuffer{};
+    dstBuffer.basePtr    = dstAlloc;
+    dstBuffer.strides[3] = 1;
+    dstBuffer.strides[2] = kDstRowPitch;
+    dstBuffer.strides[1] = int64_t{kHeight} * kDstRowPitch;
+    dstBuffer.strides[0] = int64_t{kChannels} * kHeight * kDstRowPitch;
+
+    const nvcv::TensorShape shape{
+        {kSamples, kChannels, kHeight, kWidth},
+        "NCHW"
+    };
+    nvcv::Tensor src = nvcv::TensorWrapData(nvcv::TensorDataStridedCuda{shape, nvcv::TYPE_U8, srcBuffer});
+    nvcv::Tensor dst = nvcv::TensorWrapData(nvcv::TensorDataStridedCuda{shape, nvcv::TYPE_U8, dstBuffer});
+
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+    cvcuda::GammaContrast op(kSamples, kChannels);
+    EXPECT_NO_THROW(op(stream, src, dst, kGamma, kGain, NVCV_ROUND_NEAREST));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+
+    std::vector<uint8_t> hostDst(static_cast<size_t>(dstBytes));
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(hostDst.data(), dstAlloc, dstBytes, cudaMemcpyDeviceToHost));
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+    ASSERT_EQ(cudaSuccess, cudaFree(srcAlloc));
+    ASSERT_EQ(cudaSuccess, cudaFree(dstAlloc));
+
+    int mismatches = 0;
+    for (int row = 0; row < kSamples * kChannels * kHeight; ++row)
+    {
+        for (int x = 0; x < kWidth; ++x)
+        {
+            const uint8_t in   = hostSrc[row * kSrcRowPitch + x];
+            const float   v    = std::pow(in / 255.0f, kGamma) * kGain * 255.0f;
+            const int     gold = std::min(255, std::max(0, static_cast<int>(std::lround(v))));
+            const uint8_t got  = hostDst[row * kDstRowPitch + x];
+            if (static_cast<int>(got) == gold)
+            {
+                continue;
+            }
+            ++mismatches;
+            if (mismatches <= 4)
+            {
+                const int n = row / (kChannels * kHeight);
+                const int c = (row / kHeight) % kChannels;
+                const int y = row % kHeight;
+                ADD_FAILURE() << "n=" << n << " c=" << c << " y=" << y << " x=" << x << " got=" << static_cast<int>(got)
+                              << " gold=" << gold;
+            }
+        }
+    }
+    EXPECT_EQ(0, mismatches);
+}
+
+TEST(OpGammaContrastTensor, strided_gamma_shape_fallbacks)
+{
+    static constexpr int samples       = 2;
+    static constexpr int channels      = 3;
+    constexpr int        width         = 13;
+    constexpr int        height        = 7;
+    constexpr int64_t    elementStride = 2 * sizeof(float);
+
+    auto makeStridedGamma
+        = [](const nvcv::TensorShape &shape, const std::vector<int64_t> &strides, const std::vector<float> &storage)
+    {
+        NVCVByte *allocation{};
+        EXPECT_EQ(cudaSuccess, cudaMalloc(reinterpret_cast<void **>(&allocation), storage.size() * sizeof(float)));
+        if (allocation == nullptr)
+        {
+            return nvcv::Tensor{};
+        }
+
+        EXPECT_EQ(cudaSuccess,
+                  cudaMemcpy(allocation, storage.data(), storage.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+        nvcv::TensorDataStridedCuda::Buffer buffer{};
+        buffer.basePtr = allocation;
+        for (int dim = 0; dim < shape.rank(); ++dim)
+        {
+            buffer.strides[dim] = strides[dim];
+        }
+
+        return nvcv::TensorWrapData(nvcv::TensorDataStridedCuda{shape, nvcv::TYPE_F32, buffer},
+                                    nvcv::TensorDataCleanupCallback{[allocation](const nvcv::TensorData &)
+                                                                    {
+                                                                        EXPECT_EQ(cudaSuccess, cudaFree(allocation));
+                                                                    }});
+    };
+
+    auto runParity = [&](nvcv::Tensor &gammaTensor, const char *caseName)
+    {
+        SCOPED_TRACE(caseName);
+        test::planar::RunTensorParity(
+            nvcv::FMT_RGB8p, nvcv::FMT_RGB8, width, height, width, height, samples,
+            [&gammaTensor](cudaStream_t stream, const nvcv::Tensor &src, const nvcv::Tensor &dst, nvcv::ImageFormat)
+            {
+                cvcuda::GammaContrast op(samples, channels);
+                EXPECT_NO_THROW(op(stream, src, dst, gammaTensor));
+            });
+    };
+
+    const std::vector<float> perImageValues{0.6f, 1.4f};
+    nvcv::Tensor             perImageRank1({{samples}, "N"}, nvcv::TYPE_F32);
+    ASSERT_NO_FATAL_FAILURE(UploadGammaTensor(perImageRank1, perImageValues));
+    runParity(perImageRank1, "rank1 per-image gamma");
+
+    const std::vector<float> perImageStorage{0.6f, 0.f, 1.4f, 0.f};
+    nvcv::Tensor             perImageRank2 = makeStridedGamma(
+                    nvcv::TensorShape{
+            {samples, 1},
+            "XY"
+    },
+                    {elementStride, sizeof(float)}, perImageStorage);
+    runParity(perImageRank2, "rank2 per-image gamma");
+
+    const std::array<float, samples * channels> perChannelValues{0.6f, 0.9f, 1.2f, 1.5f, 1.8f, 2.1f};
+    std::vector<float>                          perChannelStorage(perChannelValues.size() * 2, 0.f);
+    for (size_t i = 0; i < perChannelValues.size(); ++i)
+    {
+        perChannelStorage[2 * i] = perChannelValues[i];
+    }
+    const std::vector<float> perChannelDense(perChannelValues.begin(), perChannelValues.end());
+    nvcv::Tensor             perChannelRank1({{samples * channels}, "N"}, nvcv::TYPE_F32);
+    ASSERT_NO_FATAL_FAILURE(UploadGammaTensor(perChannelRank1, perChannelDense));
+    runParity(perChannelRank1, "rank1 per-channel gamma");
+
+    nvcv::Tensor invalidPerChannel = makeStridedGamma(
+        nvcv::TensorShape{
+            {samples * channels, 1},
+            "XY"
+    },
+        {elementStride, sizeof(float)}, perChannelStorage);
+
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+    nvcv::Tensor          src = nvcv::util::CreateTensor(samples, width, height, nvcv::FMT_RGB8);
+    nvcv::Tensor          dst = nvcv::util::CreateTensor(samples, width, height, nvcv::FMT_RGB8);
+    cvcuda::GammaContrast op(samples, channels);
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT, nvcv::ProtectCall([&] { op(stream, src, dst, invalidPerChannel); }));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
     ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
 }

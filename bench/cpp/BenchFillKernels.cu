@@ -17,6 +17,8 @@
 
 #include "BenchFillKernels.hpp"
 
+#include <cuda_fp16.h>
+
 #include <cstdint>
 #include <type_traits>
 
@@ -42,11 +44,14 @@ inline __device__ std::uint32_t hash32(std::uint64_t seed, std::uint64_t idx)
 template<typename T>
 inline __device__ T sample_typed(std::uint32_t s)
 {
-    if constexpr (std::is_floating_point_v<T>)
+    // Compute type: half draws in float and narrows once on return (mirrors the host
+    // LcgGenerator, which draws half values from a float distribution).
+    using CT = std::conditional_t<std::is_same_v<T, __half>, float, T>;
+    if constexpr (std::is_floating_point_v<CT>)
     {
         // Default float range in host LcgValues is uniform_real_distribution(-1, +1).
-        constexpr T kInv = static_cast<T>(2.0) / static_cast<T>(4294967295.0);
-        return static_cast<T>(-1) + static_cast<T>(s) * kInv;
+        constexpr CT kInv = static_cast<CT>(2.0) / static_cast<CT>(4294967295.0);
+        return static_cast<T>(static_cast<CT>(-1) + static_cast<CT>(s) * kInv);
     }
     else
     {
@@ -64,7 +69,17 @@ __global__ void randomFillTypedKernel(T *data, size_t n_elements, std::uint64_t 
     {
         return;
     }
-    data[idx] = sample_typed<T>(hash32(seed, idx));
+    const auto word = hash32(seed, idx);
+    if constexpr (std::is_integral_v<T> && sizeof(T) == 8)
+    {
+        // A second word exercises all 64 bits, including negative signed inputs.
+        const auto bits = (static_cast<unsigned long long>(word) << 32) | hash32(seed ^ 0xd1b54a32d192ed03ULL, idx);
+        data[idx]       = static_cast<T>(bits);
+    }
+    else
+    {
+        data[idx] = sample_typed<T>(word);
+    }
 }
 
 // Tensor-rank checkerboard: parity from (coord0 + coord1 + coord2 + coord3),
@@ -172,8 +187,11 @@ CVCUDA_BENCH_INSTANTIATE_FILL(std::uint32_t)
 CVCUDA_BENCH_INSTANTIATE_FILL(std::int8_t)
 CVCUDA_BENCH_INSTANTIATE_FILL(std::int16_t)
 CVCUDA_BENCH_INSTANTIATE_FILL(std::int32_t)
+CVCUDA_BENCH_INSTANTIATE_FILL(long long)
+CVCUDA_BENCH_INSTANTIATE_FILL(unsigned long long)
 CVCUDA_BENCH_INSTANTIATE_FILL(float)
 CVCUDA_BENCH_INSTANTIATE_FILL(double)
+CVCUDA_BENCH_INSTANTIATE_FILL(__half)
 
 #undef CVCUDA_BENCH_INSTANTIATE_FILL
 

@@ -18,17 +18,22 @@
 #include "CudaDeviceUtils.hpp"
 #include "Nvtx.hpp"
 #include "OpAdvCvtColor.hpp"
-#include "legacy/CvCudaLegacy.h"
-#include "legacy/CvCudaLegacyHelpers.hpp"
-#include "nvcv/TensorDataAccess.hpp"
+#include "TensorAccessValidation.hpp"
 
-#include "legacy/CvCudaUtils.cuh"
-
+#include <cvcuda/cuda_tools/SaturateCast.hpp>
 #include <cvcuda/cuda_tools/TensorWrap.hpp>
+#include <cvcuda/cuda_tools/TypeTraits.hpp>
 #include <nvcv/ColorSpec.hpp>
+#include <nvcv/DataType.hpp>
 #include <nvcv/Exception.hpp>
+#include <nvcv/TensorDataAccess.hpp>
 #include <nvcv/TensorLayout.hpp>
+#include <nvcv/util/Assert.h>
 #include <nvcv/util/CheckError.hpp>
+#include <nvcv/util/Math.hpp>
+
+#include <algorithm>
+#include <cstdint>
 
 #define BLOCK 32
 
@@ -44,8 +49,8 @@ static_assert(Planar444RowsPerThreadForSM(89) == 1);
 static_assert(Planar444RowsPerThreadForSM(86) == 4);
 static_assert(Planar444RowsPerThreadForSM(90) == 4);
 
-namespace legacy = nvcv::legacy::cuda_op;
-namespace cuda   = nvcv::cuda;
+namespace cuda = nvcv::cuda;
+namespace util = nvcv::util;
 
 struct RGB2YUVConstants
 {
@@ -64,6 +69,8 @@ struct YUV2RGBConstants
     const int V2R;
 };
 
+static constexpr int yuv_shift = 14;
+
 /*
  * YUV conversion formula
  * Y  = R2YF * r * + G2YF * g + B2YF * b
@@ -80,10 +87,11 @@ struct YUV2RGBConstants
 // static constexpr float R2VF_601 = 0.713266762;  // 1.0f/1.402f Cr/V
 
 static constexpr int R2Y_601 = 4899;  // = R2YF*16384
-static constexpr int G2Y_601 = 9671;  // = G2YF*16384
+static constexpr int G2Y_601 = 9617;  // = G2YF*16384
 static constexpr int B2Y_601 = 1868;  // = B2YF*16384
 static constexpr int B2U_601 = 9246;  // = B2UF*16384 Cb
 static constexpr int R2V_601 = 11686; // = R2VF*16384 Cr
+static_assert(R2Y_601 + G2Y_601 + B2Y_601 == (1 << yuv_shift), "BT.601 luma row must be normalized");
 
 // YUV > RGB conversion (inverse of the forward matrix)
 // static constexpr float V2RF_601 = 1.402f;
@@ -97,17 +105,18 @@ static constexpr int V2G_601 = -11698; // = V2GF*16384
 static constexpr int U2B_601 = 29032;  // = U2BF*16384
 
 // Values per: https://www.itu.int/rec/R-REC-BT.709
-// static constexpr float R2YF_709 = 0.2126f;      //Kr 601
-// static constexpr float G2YF_709 = 0.7152f;      //Kg 601
-// static constexpr float B2YF_709 = 0.0772f;      //Kb 601
+// static constexpr float R2YF_709 = 0.2126f;      //Kr 709
+// static constexpr float G2YF_709 = 0.7152f;      //Kg 709
+// static constexpr float B2YF_709 = 0.0722f;      //Kb 709
 // static constexpr float B2UF_709 = 0.538909248f; //1.0f/1.8556f Cb/U
 // static constexpr float R2VF_709 = 0.63500127f;  // 1.0f/1.5748f Cr/V
 
 static constexpr int R2Y_709 = 3483;  // = R2YF*16384
 static constexpr int G2Y_709 = 11718; // = G2YF*16384
-static constexpr int B2Y_709 = 1265;  // = B2YF*16384
+static constexpr int B2Y_709 = 1183;  // = B2YF*16384
 static constexpr int B2U_709 = 8829;  // = B2UF*16384 Cb
 static constexpr int R2V_709 = 10404; // = R2VF*16384 Cr
+static_assert(R2Y_709 + G2Y_709 + B2Y_709 == (1 << yuv_shift), "BT.709 luma row must be normalized");
 
 // YUV > RGB conversion (inverse of the forward matrix)
 // static constexpr float V2RF_709 = 1.5748f;
@@ -121,9 +130,9 @@ static constexpr int V2G_709 = -7670; // = V2GF*16384
 static constexpr int U2B_709 = 30402; // = U2BF*16384
 
 // Values per: https://www.itu.int/rec/R-REC-BT.2020
-// static constexpr float R2YF_2020 = 0.2627f;      //Kr 601
-// static constexpr float G2YF_2020 = 0.6780f;      //Kg 601
-// static constexpr float B2YF_2020 = 0.0593f;      //Kb 601
+// static constexpr float R2YF_2020 = 0.2627f;      //Kr 2020
+// static constexpr float G2YF_2020 = 0.6780f;      //Kg 2020
+// static constexpr float B2YF_2020 = 0.0593f;      //Kb 2020
 // static constexpr float B2UF_2020 = 0.531519082f; //1.0f/1.8814f Cb/U
 // static constexpr float R2VF_2020 = 0.678150007f; //1.0f/1.4746f // Cr/V
 
@@ -132,6 +141,7 @@ static constexpr int G2Y_2020 = 11108; // = G2YF*16384
 static constexpr int B2Y_2020 = 972;   // = B2YF*16384
 static constexpr int B2U_2020 = 8708;  // = B2UF*16384 Cb
 static constexpr int R2V_2020 = 11111; // = R2VF*16384 Cr
+static_assert(R2Y_2020 + G2Y_2020 + B2Y_2020 == (1 << yuv_shift), "BT.2020 luma row must be normalized");
 
 // YUV > RGB conversion (inverse of the forward matrix)
 // static constexpr float V2RF_2020 = 1.4746f;
@@ -154,7 +164,6 @@ YUV2RGBConstants yuv2rgb_709 = {U2B_709, U2G_709, V2G_709, V2R_709};
 RGB2YUVConstants rgb2yuv_2020 = {R2Y_2020, G2Y_2020, B2Y_2020, B2U_2020, R2V_2020};
 YUV2RGBConstants yuv2rgb_2020 = {U2B_2020, U2G_2020, V2G_2020, V2R_2020};
 
-static constexpr int yuv_shift = 14;
 #define CV_DESCALE(x, n) (((x) + (1 << ((n)-1))) >> (n))
 
 template<class SrcWrapper, class DstWrapper, typename T = typename DstWrapper::ValueType>
@@ -166,7 +175,7 @@ __global__ void yuv_to_bgr_char_nhwc(SrcWrapper src, DstWrapper dst, int2 dstSiz
 
     if (dst_x >= dstSize.x || dst_y >= dstSize.y)
         return;
-    const int batch_idx = get_batch_idx();
+    const int batch_idx = blockIdx.z;
     T         Y         = *src.ptr(batch_idx, dst_y, dst_x, 0);
     T         Cb        = *src.ptr(batch_idx, dst_y, dst_x, 1);
     T         Cr        = *src.ptr(batch_idx, dst_y, dst_x, 2);
@@ -192,7 +201,7 @@ __global__ void yuv_to_bgr_char_nchw(SrcWrapper src, DstWrapper dst, int2 dstSiz
 
     if (dst_x >= dstSize.x || dst_y0 >= dstSize.y)
         return;
-    const int batch_idx = get_batch_idx();
+    const int batch_idx = blockIdx.z;
 
     T Y[RowsPerThread];
     T Cb[RowsPerThread];
@@ -238,7 +247,7 @@ __global__ void bgr_to_yuv_char_nhwc(SrcWrapper src, DstWrapper dst, int2 dstSiz
     int dst_y = blockIdx.y * blockDim.y + threadIdx.y;
     if (dst_x >= dstSize.x || dst_y >= dstSize.y)
         return;
-    const int batch_idx = get_batch_idx();
+    const int batch_idx = blockIdx.z;
     int       B         = *src.ptr(batch_idx, dst_y, dst_x, bidx);
     int       G         = *src.ptr(batch_idx, dst_y, dst_x, 1);
     int       R         = *src.ptr(batch_idx, dst_y, dst_x, bidx ^ 2);
@@ -262,7 +271,7 @@ __global__ void bgr_to_yuv_char_nchw(SrcWrapper src, DstWrapper dst, int2 dstSiz
     int dst_y0 = blockIdx.y * blockDim.y * RowsPerThread + threadIdx.y;
     if (dst_x >= dstSize.x || dst_y0 >= dstSize.y)
         return;
-    const int batch_idx = get_batch_idx();
+    const int batch_idx = blockIdx.z;
 
     int B[RowsPerThread];
     int G[RowsPerThread];
@@ -348,7 +357,7 @@ __global__ void yuv420sp_to_bgr_char_nhwc(SrcWrapper src, DstWrapper dst, int2 d
     int dst_y = 2 * (blockIdx.y * blockDim.y + threadIdx.y);
     if (dst_x >= dstSize.x || dst_y >= dstSize.y)
         return;
-    const int batch_idx = get_batch_idx();
+    const int batch_idx = blockIdx.z;
 
     // The four luma pixels in this tile share one subsampled chroma pair.
     T U = *src.ptr(batch_idx, dstSize.y + dst_y / 2, dst_x + uidx);
@@ -394,7 +403,7 @@ __global__ void yuv420sp_to_bgra_char_nhwc(SrcWrapper src, DstWrapper dst, int2 
     int dst_y = blockIdx.y * blockDim.y + threadIdx.y;
     if (dst_x >= dstSize.x || dst_y >= dstSize.y)
         return;
-    const int batch_idx = get_batch_idx();
+    const int batch_idx = blockIdx.z;
     int       uv_x      = (dst_x % 2 == 0) ? dst_x : (dst_x - 1);
 
     T Y = *src.ptr(batch_idx, dst_y, dst_x, 0);
@@ -418,7 +427,7 @@ __global__ void yuv420sp_to_bgr_char_nchw(SrcWrapper src, DstWrapper dst, int2 d
     int dst_y = 2 * (blockIdx.y * blockDim.y + threadIdx.y);
     if (dst_x >= dstSize.x || dst_y >= dstSize.y)
         return;
-    const int batch_idx = get_batch_idx();
+    const int batch_idx = blockIdx.z;
 
     // The four luma pixels in this tile share one subsampled chroma pair.
     T U = *src.ptr(batch_idx, 0, dstSize.y + dst_y / 2, dst_x + uidx);
@@ -446,14 +455,14 @@ __global__ void yuv420sp_to_bgr_char_nchw(SrcWrapper src, DstWrapper dst, int2 d
 }
 
 template<class SrcWrapper, class DstWrapper, typename T = typename DstWrapper::ValueType>
-__global__ void bgr_to_yuv420sp_char_nhwc(SrcWrapper src, DstWrapper dst, int2 srcSize, int scn, int bidx, int uidx,
+__global__ void bgr_to_yuv420sp_char_nhwc(SrcWrapper src, DstWrapper dst, int2 srcSize, int bidx, int uidx,
                                           const RGB2YUVConstants cooef)
 {
     int src_x = 2 * (blockIdx.x * blockDim.x + threadIdx.x);
     int src_y = 2 * (blockIdx.y * blockDim.y + threadIdx.y);
     if (src_x >= srcSize.x || src_y >= srcSize.y)
         return;
-    const int batch_idx = get_batch_idx();
+    const int batch_idx = blockIdx.z;
 
     // A single thread owns the tile so the four luma values and averaged chroma pair reuse the same pixel loads.
     uint8_t b0 = static_cast<uint8_t>(*src.ptr(batch_idx, src_y, src_x, bidx));
@@ -496,14 +505,14 @@ __global__ void bgr_to_yuv420sp_char_nhwc(SrcWrapper src, DstWrapper dst, int2 s
 }
 
 template<class SrcWrapper, class DstWrapper, typename T = typename DstWrapper::ValueType>
-__global__ void bgr_to_yuv420sp_char_nchw(SrcWrapper src, DstWrapper dst, int2 srcSize, int scn, int bidx, int uidx,
+__global__ void bgr_to_yuv420sp_char_nchw(SrcWrapper src, DstWrapper dst, int2 srcSize, int bidx, int uidx,
                                           const RGB2YUVConstants cooef)
 {
     int src_x = 2 * (blockIdx.x * blockDim.x + threadIdx.x);
     int src_y = 2 * (blockIdx.y * blockDim.y + threadIdx.y);
     if (src_x >= srcSize.x || src_y >= srcSize.y)
         return;
-    const int batch_idx = get_batch_idx();
+    const int batch_idx = blockIdx.z;
 
     // A single thread owns the tile so the four luma values and averaged chroma pair reuse the same pixel loads.
     uint8_t b0 = static_cast<uint8_t>(*src.ptr(batch_idx, bidx, src_y, src_x));
@@ -596,10 +605,19 @@ static bool isSupportedConversionCode(NVCVColorConversionCode code)
     }
 }
 
+// AdvCvtColor has always used full-sample-range U8 arithmetic, so _ER names the range explicitly
+// while selecting the same coefficient family as the corresponding compatibility base spec.
+// Canonicalizing only the range bit keeps exact-spec validation below: specs with the same encoding but
+// different transfer functions or chroma locations remain unsupported.
+static NVCVColorSpec canonicalizeRangeSpec(nvcv::ColorSpec spec)
+{
+    return static_cast<NVCVColorSpec>(spec.colorRange(nvcv::ColorRange::LIMITED));
+}
+
 static bool isSupportedColorSpec(nvcv::ColorSpec spec)
 {
     //may need to be extended to check for conversion type
-    switch (static_cast<NVCVColorSpec>(spec))
+    switch (canonicalizeRangeSpec(spec))
     {
     case NVCV_COLOR_SPEC_BT601:
     case NVCV_COLOR_SPEC_BT709:
@@ -671,7 +689,7 @@ static bool checkInputOutputTensors(NVCVColorConversionCode code, const nvcv::Te
 
 static const RGB2YUVConstants &getRGB2YUVCooef(nvcv::ColorSpec spec)
 {
-    switch (static_cast<NVCVColorSpec>(spec))
+    switch (canonicalizeRangeSpec(spec))
     {
     case NVCV_COLOR_SPEC_BT601:
         return rgb2yuv_601;
@@ -686,7 +704,7 @@ static const RGB2YUVConstants &getRGB2YUVCooef(nvcv::ColorSpec spec)
 
 static const YUV2RGBConstants &getYUV2RGBCooef(nvcv::ColorSpec spec)
 {
-    switch (static_cast<NVCVColorSpec>(spec))
+    switch (canonicalizeRangeSpec(spec))
     {
     case NVCV_COLOR_SPEC_BT601:
         return yuv2rgb_601;
@@ -699,6 +717,20 @@ static const YUV2RGBConstants &getYUV2RGBCooef(nvcv::ColorSpec spec)
     }
 }
 
+// The kernels address both tensors through int32_t-offset TensorWraps, so the whole batch must be
+// reachable from a 32-bit byte offset.
+static void checkStridesFitInt32(const nvcv::TensorDataAccessStridedImagePlanar &inAccess,
+                                 const nvcv::TensorDataAccessStridedImagePlanar &outAccess)
+{
+    auto outMaxStride = outAccess.sampleStride() * outAccess.numSamples();
+    auto inMaxStride  = inAccess.sampleStride() * inAccess.numSamples();
+    if (std::max(outMaxStride, inMaxStride) > cuda::TypeTraits<int32_t>::max)
+    {
+        throw nvcv::Exception(nvcv::Status::ERROR_OVERFLOW, "Input or output size exceeds %d. Tensor is too large.",
+                              cuda::TypeTraits<int32_t>::max);
+    }
+}
+
 namespace cvcuda::priv {
 
 AdvCvtColor::AdvCvtColor() {}
@@ -707,19 +739,8 @@ void AdvCvtColor::operator()(cudaStream_t stream, const nvcv::Tensor &in, const 
                              NVCVColorConversionCode code, nvcv::ColorSpec spec) const
 {
     CVCUDA_NVTX_RANGE("cvcuda::AdvCvtColor::operator()[Tensor]");
-    auto inData = in.exportData<nvcv::TensorDataStridedCuda>();
-    if (inData == nullptr)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Input must be cuda-accessible, pitch-linear tensor");
-    }
-
-    auto outData = out.exportData<nvcv::TensorDataStridedCuda>();
-    if (outData == nullptr)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Output must be cuda-accessible, pitch-linear tensor");
-    }
+    auto inData  = RequireCudaTensor(in, "Input");
+    auto outData = RequireCudaTensor(out, "Output");
 
     if (inData->dtype() != nvcv::TYPE_U8)
     {
@@ -780,7 +801,6 @@ void AdvCvtColor::operator()(cudaStream_t stream, const nvcv::Tensor &in, const 
     default:
         break;
     }
-    return;
 }
 
 void AdvCvtColor::Yuv2Bgr(cudaStream_t stream, const nvcv::TensorDataStridedCuda &in,
@@ -794,62 +814,41 @@ void AdvCvtColor::Yuv2Bgr(cudaStream_t stream, const nvcv::TensorDataStridedCuda
     auto outAccess = nvcv::TensorDataAccessStridedImagePlanar::Create(out);
     NVCV_ASSERT(outAccess);
 
-    nvcv::legacy::cuda_op::DataType  inDataType  = nvcv::legacy::helpers::GetLegacyDataType(inAccess->dtype());
-    nvcv::legacy::cuda_op::DataShape inputShape  = nvcv::legacy::helpers::GetLegacyDataShape(inAccess->infoShape());
-    nvcv::legacy::cuda_op::DataShape outputShape = nvcv::legacy::helpers::GetLegacyDataShape(outAccess->infoShape());
-    int2                             dstSize{outputShape.W, outputShape.H};
+    int2 dstSize{outAccess->numCols(), outAccess->numRows()};
 
     dim3 blockSize(BLOCK, BLOCK / 4, 1);
-    dim3 gridSize(legacy::divUp(inputShape.W, blockSize.x), legacy::divUp(inputShape.H, blockSize.y), inputShape.N);
+    dim3 gridSize(util::DivUp(inAccess->numCols(), blockSize.x), util::DivUp(inAccess->numRows(), blockSize.y),
+                  inAccess->numSamples());
 
-    switch (inDataType)
+    const YUV2RGBConstants &cooef = getYUV2RGBCooef(spec);
+    checkStridesFitInt32(*inAccess, *outAccess);
+
+    if (isPlanarTensorLayout(in.layout()))
     {
-    case legacy::kCV_8U:
-    {
-        const YUV2RGBConstants &cooef        = getYUV2RGBCooef(spec);
-        auto                    outMaxStride = outAccess->sampleStride() * outAccess->numSamples();
-        auto                    inMaxStride  = inAccess->sampleStride() * inAccess->numSamples();
-        bool                    isPlanar     = isPlanarTensorLayout(in.layout());
-        if (std::max(outMaxStride, inMaxStride) <= cuda::TypeTraits<int32_t>::max)
+        auto srcWrap = cuda::CreateTensorWrapNCHW<uint8_t, int32_t>(in);
+        auto dstWrap = cuda::CreateTensorWrapNCHW<uint8_t, int32_t>(out);
+        int  sm;
+        NVCV_CHECK_THROW(GetCurrentDeviceSM(sm));
+        int  rowsPerThread = Planar444RowsPerThreadForSM(sm);
+        dim3 planarGridSize(gridSize.x, util::DivUp(inAccess->numRows(), blockSize.y * rowsPerThread), gridSize.z);
+        if (rowsPerThread == kPlanar444SM89RowsPerThread)
         {
-            if (isPlanar)
-            {
-                auto srcWrap = cuda::CreateTensorWrapNCHW<uint8_t, int32_t>(in);
-                auto dstWrap = cuda::CreateTensorWrapNCHW<uint8_t, int32_t>(out);
-                int  sm;
-                NVCV_CHECK_THROW(GetCurrentDeviceSM(sm));
-                int  rowsPerThread = Planar444RowsPerThreadForSM(sm);
-                dim3 planarGridSize(gridSize.x, legacy::divUp(inputShape.H, blockSize.y * rowsPerThread), gridSize.z);
-                if (rowsPerThread == kPlanar444SM89RowsPerThread)
-                {
-                    yuv_to_bgr_char_nchw<kPlanar444SM89RowsPerThread>
-                        <<<planarGridSize, blockSize, 0, stream>>>(srcWrap, dstWrap, dstSize, bidx, cooef);
-                }
-                else
-                {
-                    yuv_to_bgr_char_nchw<kPlanar444RowsPerThread>
-                        <<<planarGridSize, blockSize, 0, stream>>>(srcWrap, dstWrap, dstSize, bidx, cooef);
-                }
-            }
-            else
-            {
-                auto srcWrap = cuda::CreateTensorWrapNHWC<uint8_t, int32_t>(in);
-                auto dstWrap = cuda::CreateTensorWrapNHWC<uint8_t, int32_t>(out);
-                yuv_to_bgr_char_nhwc<<<gridSize, blockSize, 0, stream>>>(srcWrap, dstWrap, dstSize, bidx, cooef);
-            }
+            yuv_to_bgr_char_nchw<kPlanar444SM89RowsPerThread>
+                <<<planarGridSize, blockSize, 0, stream>>>(srcWrap, dstWrap, dstSize, bidx, cooef);
         }
         else
         {
-            throw nvcv::Exception(nvcv::Status::ERROR_OVERFLOW, "Input or output size exceeds %d. Tensor is too large.",
-                                  cuda::TypeTraits<int32_t>::max);
+            yuv_to_bgr_char_nchw<kPlanar444RowsPerThread>
+                <<<planarGridSize, blockSize, 0, stream>>>(srcWrap, dstWrap, dstSize, bidx, cooef);
         }
-        checkKernelErrors();
     }
-    break;
-    default:
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Unsupported data type");
+    else
+    {
+        auto srcWrap = cuda::CreateTensorWrapNHWC<uint8_t, int32_t>(in);
+        auto dstWrap = cuda::CreateTensorWrapNHWC<uint8_t, int32_t>(out);
+        yuv_to_bgr_char_nhwc<<<gridSize, blockSize, 0, stream>>>(srcWrap, dstWrap, dstSize, bidx, cooef);
     }
-    return;
+    NVCV_CHECK_THROW(cudaGetLastError());
 }
 
 void AdvCvtColor::Bgr2Yuv(cudaStream_t stream, const nvcv::TensorDataStridedCuda &in,
@@ -863,63 +862,41 @@ void AdvCvtColor::Bgr2Yuv(cudaStream_t stream, const nvcv::TensorDataStridedCuda
     auto outAccess = nvcv::TensorDataAccessStridedImagePlanar::Create(out);
     NVCV_ASSERT(outAccess);
 
-    nvcv::legacy::cuda_op::DataType  inDataType  = nvcv::legacy::helpers::GetLegacyDataType(inAccess->dtype());
-    nvcv::legacy::cuda_op::DataShape inputShape  = nvcv::legacy::helpers::GetLegacyDataShape(inAccess->infoShape());
-    nvcv::legacy::cuda_op::DataShape outputShape = nvcv::legacy::helpers::GetLegacyDataShape(outAccess->infoShape());
-
     dim3 blockSize(BLOCK, BLOCK / 4, 1);
-    dim3 gridSize(legacy::divUp(inputShape.W, blockSize.x), legacy::divUp(inputShape.H, blockSize.y), inputShape.N);
+    dim3 gridSize(util::DivUp(inAccess->numCols(), blockSize.x), util::DivUp(inAccess->numRows(), blockSize.y),
+                  inAccess->numSamples());
 
-    int2 dstSize{outputShape.W, outputShape.H};
+    int2 dstSize{outAccess->numCols(), outAccess->numRows()};
 
-    switch (inDataType)
+    const RGB2YUVConstants &cooef = getRGB2YUVCooef(spec);
+    checkStridesFitInt32(*inAccess, *outAccess);
+
+    if (isPlanarTensorLayout(in.layout()))
     {
-    case legacy::kCV_8U:
-    {
-        const RGB2YUVConstants &cooef        = getRGB2YUVCooef(spec);
-        auto                    outMaxStride = outAccess->sampleStride() * outAccess->numSamples();
-        auto                    inMaxStride  = inAccess->sampleStride() * inAccess->numSamples();
-        bool                    isPlanar     = isPlanarTensorLayout(in.layout());
-        if (std::max(outMaxStride, inMaxStride) <= cuda::TypeTraits<int32_t>::max)
+        auto srcWrap = cuda::CreateTensorWrapNCHW<uint8_t, int32_t>(in);
+        auto dstWrap = cuda::CreateTensorWrapNCHW<uint8_t, int32_t>(out);
+        int  sm;
+        NVCV_CHECK_THROW(GetCurrentDeviceSM(sm));
+        int  rowsPerThread = Planar444RowsPerThreadForSM(sm);
+        dim3 planarGridSize(gridSize.x, util::DivUp(inAccess->numRows(), blockSize.y * rowsPerThread), gridSize.z);
+        if (rowsPerThread == kPlanar444SM89RowsPerThread)
         {
-            if (isPlanar)
-            {
-                auto srcWrap = cuda::CreateTensorWrapNCHW<uint8_t, int32_t>(in);
-                auto dstWrap = cuda::CreateTensorWrapNCHW<uint8_t, int32_t>(out);
-                int  sm;
-                NVCV_CHECK_THROW(GetCurrentDeviceSM(sm));
-                int  rowsPerThread = Planar444RowsPerThreadForSM(sm);
-                dim3 planarGridSize(gridSize.x, legacy::divUp(inputShape.H, blockSize.y * rowsPerThread), gridSize.z);
-                if (rowsPerThread == kPlanar444SM89RowsPerThread)
-                {
-                    bgr_to_yuv_char_nchw<kPlanar444SM89RowsPerThread>
-                        <<<planarGridSize, blockSize, 0, stream>>>(srcWrap, dstWrap, dstSize, bidx, cooef);
-                }
-                else
-                {
-                    bgr_to_yuv_char_nchw<kPlanar444RowsPerThread>
-                        <<<planarGridSize, blockSize, 0, stream>>>(srcWrap, dstWrap, dstSize, bidx, cooef);
-                }
-            }
-            else
-            {
-                auto srcWrap = cuda::CreateTensorWrapNHWC<uint8_t, int32_t>(in);
-                auto dstWrap = cuda::CreateTensorWrapNHWC<uint8_t, int32_t>(out);
-                bgr_to_yuv_char_nhwc<<<gridSize, blockSize, 0, stream>>>(srcWrap, dstWrap, dstSize, bidx, cooef);
-            }
+            bgr_to_yuv_char_nchw<kPlanar444SM89RowsPerThread>
+                <<<planarGridSize, blockSize, 0, stream>>>(srcWrap, dstWrap, dstSize, bidx, cooef);
         }
         else
         {
-            throw nvcv::Exception(nvcv::Status::ERROR_OVERFLOW, "Input or output size exceeds %d. Tensor is too large.",
-                                  cuda::TypeTraits<int32_t>::max);
+            bgr_to_yuv_char_nchw<kPlanar444RowsPerThread>
+                <<<planarGridSize, blockSize, 0, stream>>>(srcWrap, dstWrap, dstSize, bidx, cooef);
         }
-        checkKernelErrors();
     }
-    break;
-    default:
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Unsupported data type");
+    else
+    {
+        auto srcWrap = cuda::CreateTensorWrapNHWC<uint8_t, int32_t>(in);
+        auto dstWrap = cuda::CreateTensorWrapNHWC<uint8_t, int32_t>(out);
+        bgr_to_yuv_char_nhwc<<<gridSize, blockSize, 0, stream>>>(srcWrap, dstWrap, dstSize, bidx, cooef);
     }
-    return;
+    NVCV_CHECK_THROW(cudaGetLastError());
 }
 
 void AdvCvtColor::NvYuv2Bgr(cudaStream_t stream, const nvcv::TensorDataStridedCuda &in,
@@ -937,86 +914,64 @@ void AdvCvtColor::NvYuv2Bgr(cudaStream_t stream, const nvcv::TensorDataStridedCu
     auto outAccess = nvcv::TensorDataAccessStridedImagePlanar::Create(out);
     NVCV_ASSERT(outAccess);
 
-    nvcv::legacy::cuda_op::DataType  inDataType  = nvcv::legacy::helpers::GetLegacyDataType(inAccess->dtype());
-    nvcv::legacy::cuda_op::DataShape inputShape  = nvcv::legacy::helpers::GetLegacyDataShape(inAccess->infoShape());
-    nvcv::legacy::cuda_op::DataShape outputShape = nvcv::legacy::helpers::GetLegacyDataShape(outAccess->infoShape());
-
-    if (inputShape.H % 3 != 0 || inputShape.W % 2 != 0)
+    if (inAccess->numRows() % 3 != 0 || inAccess->numCols() % 2 != 0)
     {
         throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Unsupported input shape");
     }
-    if (outputShape.C != 3 && outputShape.C != 4)
+    if (outAccess->numChannels() != 3 && outAccess->numChannels() != 4)
     {
         throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Unsupported output shape channels");
     }
-    if (inputShape.C != 1)
+    if (inAccess->numChannels() != 1)
     {
         throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Unsupported input shape channels");
     }
 
-    int rgb_width  = inputShape.W;
-    int rgb_height = inputShape.H * 2 / 3;
+    int rgb_width  = inAccess->numCols();
+    int rgb_height = inAccess->numRows() * 2 / 3;
 
-    if (outputShape.H != rgb_height || outputShape.W != rgb_width || outputShape.N != inputShape.N)
+    if (outAccess->numRows() != rgb_height || outAccess->numCols() != rgb_width
+        || outAccess->numSamples() != inAccess->numSamples())
     {
         throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "invalid output shape given input");
     }
 
     dim3 tiledBlockSize(BLOCK, BLOCK / 4, 1);
-    dim3 tiledGridSize(legacy::divUp(rgb_width, tiledBlockSize.x * 2), legacy::divUp(rgb_height, tiledBlockSize.y * 2),
-                       inputShape.N);
-    int2 dstSize{outputShape.W, outputShape.H};
-    int  dcn = outputShape.C;
+    dim3 tiledGridSize(util::DivUp(rgb_width, tiledBlockSize.x * 2), util::DivUp(rgb_height, tiledBlockSize.y * 2),
+                       inAccess->numSamples());
+    int2 dstSize{outAccess->numCols(), outAccess->numRows()};
+    int  dcn = outAccess->numChannels();
 
-    switch (inDataType)
+    const YUV2RGBConstants &cooef = getYUV2RGBCooef(spec);
+    checkStridesFitInt32(*inAccess, *outAccess);
+
+    if (isPlanarTensorLayout(in.layout()))
     {
-    case legacy::kCV_8U:
+        auto srcWrap = cuda::CreateTensorWrapNCHW<uint8_t, int32_t>(in);
+        auto dstWrap = cuda::CreateTensorWrapNCHW<uint8_t, int32_t>(out);
+        yuv420sp_to_bgr_char_nchw<<<tiledGridSize, tiledBlockSize, 0, stream>>>(srcWrap, dstWrap, dstSize, dcn, bidx,
+                                                                                uidx, cooef);
+    }
+    else
     {
-        const YUV2RGBConstants &cooef        = getYUV2RGBCooef(spec);
-        auto                    outMaxStride = outAccess->sampleStride() * outAccess->numSamples();
-        auto                    inMaxStride  = inAccess->sampleStride() * inAccess->numSamples();
-        bool                    isPlanar     = isPlanarTensorLayout(in.layout());
-        if (std::max(outMaxStride, inMaxStride) <= cuda::TypeTraits<int32_t>::max)
+        auto srcWrap = cuda::CreateTensorWrapNHWC<uint8_t, int32_t>(in);
+        auto dstWrap = cuda::CreateTensorWrapNHWC<uint8_t, int32_t>(out);
+        if (dcn == 4)
         {
-            if (isPlanar)
-            {
-                auto srcWrap = cuda::CreateTensorWrapNCHW<uint8_t, int32_t>(in);
-                auto dstWrap = cuda::CreateTensorWrapNCHW<uint8_t, int32_t>(out);
-                yuv420sp_to_bgr_char_nchw<<<tiledGridSize, tiledBlockSize, 0, stream>>>(srcWrap, dstWrap, dstSize, dcn,
-                                                                                        bidx, uidx, cooef);
-            }
-            else
-            {
-                auto srcWrap = cuda::CreateTensorWrapNHWC<uint8_t, int32_t>(in);
-                auto dstWrap = cuda::CreateTensorWrapNHWC<uint8_t, int32_t>(out);
-                if (dcn == 4)
-                {
-                    dim3 blockSize(BLOCK, BLOCK / 4, 1);
-                    dim3 gridSize(legacy::divUp(rgb_width, blockSize.x), legacy::divUp(rgb_height, blockSize.y),
-                                  inputShape.N);
-                    yuv420sp_to_bgra_char_nhwc<<<gridSize, blockSize, 0, stream>>>(srcWrap, dstWrap, dstSize, bidx,
-                                                                                   uidx, cooef);
-                }
-                else
-                {
-                    const bool packedOutput = outAccess->chStride() == 1 && outAccess->colStride() == dcn;
-                    yuv420sp_to_bgr_char_nhwc<<<tiledGridSize, tiledBlockSize, 0, stream>>>(
-                        srcWrap, dstWrap, dstSize, dcn, bidx, uidx, cooef, packedOutput);
-                }
-            }
+            dim3 blockSize(BLOCK, BLOCK / 4, 1);
+            dim3 gridSize(util::DivUp(rgb_width, blockSize.x), util::DivUp(rgb_height, blockSize.y),
+                          inAccess->numSamples());
+            yuv420sp_to_bgra_char_nhwc<<<gridSize, blockSize, 0, stream>>>(srcWrap, dstWrap, dstSize, bidx, uidx,
+                                                                           cooef);
         }
         else
         {
-            throw nvcv::Exception(nvcv::Status::ERROR_OVERFLOW, "Input or output size exceeds %d. Tensor is too large.",
-                                  cuda::TypeTraits<int32_t>::max);
+            const bool packedOutput = outAccess->chStride() == 1 && outAccess->colStride() == dcn;
+            yuv420sp_to_bgr_char_nhwc<<<tiledGridSize, tiledBlockSize, 0, stream>>>(srcWrap, dstWrap, dstSize, dcn,
+                                                                                    bidx, uidx, cooef, packedOutput);
         }
-        checkKernelErrors();
     }
-    break;
-    default:
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Unsupported data type");
-    }
-    return;
+    NVCV_CHECK_THROW(cudaGetLastError());
 }
 
 void AdvCvtColor::Bgr2NvYuv(cudaStream_t stream, const nvcv::TensorDataStridedCuda &in,
@@ -1034,69 +989,45 @@ void AdvCvtColor::Bgr2NvYuv(cudaStream_t stream, const nvcv::TensorDataStridedCu
     auto outAccess = nvcv::TensorDataAccessStridedImagePlanar::Create(out);
     NVCV_ASSERT(outAccess);
 
-    nvcv::legacy::cuda_op::DataType  inDataType  = nvcv::legacy::helpers::GetLegacyDataType(inAccess->dtype());
-    nvcv::legacy::cuda_op::DataShape inputShape  = nvcv::legacy::helpers::GetLegacyDataShape(inAccess->infoShape());
-    nvcv::legacy::cuda_op::DataShape outputShape = nvcv::legacy::helpers::GetLegacyDataShape(outAccess->infoShape());
-
-    if (inputShape.C != 3 && inputShape.C != 4)
+    if (inAccess->numChannels() != 3 && inAccess->numChannels() != 4)
     {
         throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Unsupported input shape");
     }
-    if (inputShape.H % 2 != 0 || inputShape.W % 2 != 0)
+    if (inAccess->numRows() % 2 != 0 || inAccess->numCols() % 2 != 0)
     {
         throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Unsupported input shape");
     }
 
-    int yuv420_width  = inputShape.W;
-    int yuv420_height = inputShape.H / 2 * 3;
+    int yuv420_width  = inAccess->numCols();
+    int yuv420_height = inAccess->numRows() / 2 * 3;
 
-    if (outputShape.H != yuv420_height || outputShape.W != yuv420_width || outputShape.N != inputShape.N)
+    if (outAccess->numRows() != yuv420_height || outAccess->numCols() != yuv420_width
+        || outAccess->numSamples() != inAccess->numSamples())
     {
         throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Unsupported output shape given input");
     }
 
-    int2 srcSize{inputShape.W, inputShape.H};
+    int2 srcSize{inAccess->numCols(), inAccess->numRows()};
     dim3 blockSize(BLOCK, BLOCK / 4, 1);
-    dim3 gridSize(legacy::divUp(inputShape.W, blockSize.x * 2), legacy::divUp(inputShape.H, blockSize.y * 2),
-                  inputShape.N);
+    dim3 gridSize(util::DivUp(srcSize.x, blockSize.x * 2), util::DivUp(srcSize.y, blockSize.y * 2),
+                  inAccess->numSamples());
 
-    switch (inDataType)
+    const RGB2YUVConstants &cooef = getRGB2YUVCooef(spec);
+    checkStridesFitInt32(*inAccess, *outAccess);
+
+    if (isPlanarTensorLayout(in.layout()))
     {
-    case legacy::kCV_8U:
+        auto srcWrap = cuda::CreateTensorWrapNCHW<uint8_t, int32_t>(in);
+        auto dstWrap = cuda::CreateTensorWrapNCHW<uint8_t, int32_t>(out);
+        bgr_to_yuv420sp_char_nchw<<<gridSize, blockSize, 0, stream>>>(srcWrap, dstWrap, srcSize, bidx, uidx, cooef);
+    }
+    else
     {
-        const RGB2YUVConstants &cooef        = getRGB2YUVCooef(spec);
-        auto                    outMaxStride = outAccess->sampleStride() * outAccess->numSamples();
-        auto                    inMaxStride  = inAccess->sampleStride() * inAccess->numSamples();
-        bool                    isPlanar     = isPlanarTensorLayout(in.layout());
-        if (std::max(outMaxStride, inMaxStride) <= cuda::TypeTraits<int32_t>::max)
-        {
-            if (isPlanar)
-            {
-                auto srcWrap = cuda::CreateTensorWrapNCHW<uint8_t, int32_t>(in);
-                auto dstWrap = cuda::CreateTensorWrapNCHW<uint8_t, int32_t>(out);
-                bgr_to_yuv420sp_char_nchw<<<gridSize, blockSize, 0, stream>>>(srcWrap, dstWrap, srcSize, inputShape.C,
-                                                                              bidx, uidx, cooef);
-            }
-            else
-            {
-                auto srcWrap = cuda::CreateTensorWrapNHWC<uint8_t, int32_t>(in);
-                auto dstWrap = cuda::CreateTensorWrapNHWC<uint8_t, int32_t>(out);
-                bgr_to_yuv420sp_char_nhwc<<<gridSize, blockSize, 0, stream>>>(srcWrap, dstWrap, srcSize, inputShape.C,
-                                                                              bidx, uidx, cooef);
-            }
-        }
-        else
-        {
-            throw nvcv::Exception(nvcv::Status::ERROR_OVERFLOW, "Input or output size exceeds %d. Tensor is too large.",
-                                  cuda::TypeTraits<int32_t>::max);
-        }
-        checkKernelErrors();
+        auto srcWrap = cuda::CreateTensorWrapNHWC<uint8_t, int32_t>(in);
+        auto dstWrap = cuda::CreateTensorWrapNHWC<uint8_t, int32_t>(out);
+        bgr_to_yuv420sp_char_nhwc<<<gridSize, blockSize, 0, stream>>>(srcWrap, dstWrap, srcSize, bidx, uidx, cooef);
     }
-    break;
-    default:
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Unsupported data type");
-    }
-    return;
+    NVCV_CHECK_THROW(cudaGetLastError());
 }
 
 } // namespace cvcuda::priv

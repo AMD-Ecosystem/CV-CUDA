@@ -45,6 +45,7 @@ from _internal.baselines import (  # noqa: E402
     BaselineError,
     expected_case_keys_for_entry,
     fake_planar_pairing_issues,
+    load_sku_policies,
 )
 from operator_source_map import (  # noqa: E402
     SHARED_KERNEL_SOURCES,
@@ -56,6 +57,17 @@ PASS, GAP, NA, MANUAL, REC = "PASS", "GAP", "N-A", "MANUAL", "RECOMMENDATION"
 DOMAINS = ("support", "test", "bench", "docs")
 
 # dtype table rows in the Doxygen Limitations table -> canonical dtype tokens
+# How a dtype cell is spelled where the operator actually instantiates it (SUP-12). The repo
+# dispatches through per-operator X-macros (`NVCV_<OP>_RUN_TYPED(U8, uchar)`), through
+# `nvcv::TYPE_*` comparisons, and through `NVCV_DATA_TYPE_*` case labels; the optional 2/3/4
+# infix is the packed-channel form of the same base type.
+INSTANTIATION_PATTERNS = [
+    re.compile(r"_RUN_TYPED\s*\(\s*([USF]\d{1,2})\s*,"),
+    re.compile(r"_BASE\s*\(\s*([USF]\d{1,2})\s*,"),
+    re.compile(r"\b(?:nvcv::)?TYPE_(?:[234])?([USF]\d{1,2})\b"),
+    re.compile(r"\bNVCV_DATA_TYPE_(?:[234])?([USF]\d{1,2})\b"),
+]
+
 DTYPE_ROW = {
     ("8bit", "Unsigned"): "u8",
     ("8bit", "Signed"): "s8",
@@ -550,9 +562,11 @@ def check_support(P: OpPaths, curated):
             tensor_summary,
             tensor_evidence,
             g,
-            ""
-            if has_tensor or tensor_absence_is_declared
-            else "Declare the Tensor Submit entry point.",
+            (
+                ""
+                if has_tensor or tensor_absence_is_declared
+                else "Declare the Tensor Submit entry point."
+            ),
         )
     )
 
@@ -744,6 +758,63 @@ def check_support(P: OpPaths, curated):
             )
         )
 
+    # SUP-12 declared-vs-instantiated dtype cells. SUP-9 only checks that *some* validation
+    # exists; nothing compares the declared table against the dtypes the dispatch code actually
+    # instantiates. Both directions matter: a declared-but-uninstantiated cell is support the
+    # header promises and the kernel may not have, and an instantiated-but-undeclared cell is
+    # either dead specialization (compile time and binary size for nothing) or real support that
+    # users cannot rely on and that no test or benchmark is obliged to cover.
+    instantiated = set()
+    for pv in P.priv:
+        ptext = read(pv) or ""
+        for rx in INSTANTIATION_PATTERNS:
+            instantiated.update(m.group(1).lower() for m in rx.finditer(ptext))
+    if not instantiated or not lim["dtypes"]:
+        out.append(
+            Finding(
+                "SUP-12",
+                "support",
+                NA,
+                "No dtype dispatch table recognised to compare with the declared matrix",
+                f"declared={sorted(lim['dtypes']) or 'none'}; priv files: "
+                f"{[rel(p) for p in P.priv] or 'none located'}",
+                g,
+            )
+        )
+    else:
+        undeclared = sorted(instantiated - lim["dtypes"])
+        uninstantiated = sorted(lim["dtypes"] - instantiated)
+        detail = (
+            f"declared={sorted(lim['dtypes'])} instantiated={sorted(instantiated)}"
+            f"{'; declared-only=' + str(uninstantiated) if uninstantiated else ''}"
+            f"{'; instantiated-only=' + str(undeclared) if undeclared else ''}"
+        )
+        if uninstantiated or undeclared:
+            out.append(
+                Finding(
+                    "SUP-12",
+                    "support",
+                    MANUAL,
+                    "Declared dtype matrix and instantiated dispatch cells disagree",
+                    detail,
+                    g,
+                    "Reconcile the header Limitations table with the dispatch arms. Note the "
+                    "scan cannot tell an image dtype from an auxiliary parameter-tensor dtype "
+                    "(e.g. an F32/F64 argument tensor), so confirm each cell before acting.",
+                )
+            )
+        else:
+            out.append(
+                Finding(
+                    "SUP-12",
+                    "support",
+                    PASS,
+                    "Declared dtype matrix matches the instantiated dispatch cells",
+                    detail,
+                    g,
+                )
+            )
+
     # Planar layouts are part of the default support contract. Only operators whose tensors do
     # not represent images may opt out, and that decision lives beside the operator Limitations.
     planar_declared = bool(lim["layouts"] & {"NCHW", "CHW"})
@@ -784,6 +855,7 @@ def check_support(P: OpPaths, curated):
         "has_tensor": has_tensor,
         "has_vs": has_vs,
         "generic_varshape": generic_varshape,
+        "tensor_absence_is_declared": tensor_absence_is_declared,
         "bench_layout_na": P.op in bench_layout_na,
         "bench_rgb_na": P.op in bench_rgb_na,
     }
@@ -927,9 +999,11 @@ def check_test(P: OpPaths, support_info):
             "TST-1",
             "test",
             PASS if ref_hits else MANUAL,
-            "Independent CPU reference present"
-            if ref_hits
-            else "No obvious CPU reference; verify",
+            (
+                "Independent CPU reference present"
+                if ref_hits
+                else "No obvious CPU reference; verify"
+            ),
             first_evidence(P.test_cpp, ref_hits) or "no Gold/Reference symbol found",
             g,
             "" if ref_hits else "Add/confirm an independent CPU reference.",
@@ -937,7 +1011,7 @@ def check_test(P: OpPaths, support_info):
     )
 
     # TST-2 / TST-3 — a positive test on the op's (non-Negative) suite, any naming convention
-    if generic_varshape and not has_tensor:
+    if support_info.get("tensor_absence_is_declared") and not has_tensor:
         out.append(
             Finding("TST-2", "test", NA, "VarShape-only op -> tensor test N-A", "", g)
         )
@@ -1014,9 +1088,11 @@ def check_test(P: OpPaths, support_info):
                 "TST-7",
                 "test",
                 PASS if fp else GAP,
-                "Equivalent image-layout parity test present"
-                if fp
-                else "Equivalent image-layout parity test MISSING",
+                (
+                    "Equivalent image-layout parity test present"
+                    if fp
+                    else "Equivalent image-layout parity test MISSING"
+                ),
                 first_evidence(P.test_cpp, fp)
                 or "no PlanarParityUtils/matches_interleaved",
                 REVIEW_OP_GUIDE,
@@ -1086,9 +1162,11 @@ def check_test(P: OpPaths, support_info):
                 "TST-10",
                 "test",
                 PASS if (seeded or not rng) else MANUAL,
-                "Inputs appear deterministic"
-                if (seeded or not rng)
-                else "RNG without obvious seed — verify",
+                (
+                    "Inputs appear deterministic"
+                    if (seeded or not rng)
+                    else "RNG without obvious seed — verify"
+                ),
                 first_evidence(P.test_cpp, seeded or rng) or "no RNG detected",
                 g,
             )
@@ -1150,9 +1228,11 @@ def check_test(P: OpPaths, support_info):
                 "TST-12",
                 "test",
                 PASS if has_vs else NA,
-                "Python VarShape via make_op_tests"
-                if has_vs
-                else "Tensor-only -> Python varshape N-A",
+                (
+                    "Python VarShape via make_op_tests"
+                    if has_vs
+                    else "Tensor-only -> Python varshape N-A"
+                ),
                 ev if has_vs else "",
                 g,
             )
@@ -1354,9 +1434,11 @@ def check_bench(P: OpPaths, support_info, do_run):
             ),
             rel(P.bench_cpp) + ("" if cpp_ok else " (missing)"),
             g,
-            ""
-            if cpp_ok
-            else "Add the C++ benchmark + register in bench/cpp/CMakeLists.txt.",
+            (
+                ""
+                if cpp_ok
+                else "Add the C++ benchmark + register in bench/cpp/CMakeLists.txt."
+            ),
         )
     )
     py_ok = P.bench_py.exists()
@@ -1373,9 +1455,11 @@ def check_bench(P: OpPaths, support_info, do_run):
             "Python bench present" + py_reg,
             rel(P.bench_py) + ("" if py_ok else " (missing)"),
             g,
-            ""
-            if py_ok
-            else "Add the Python benchmark + register in bench/python/CMakeLists.txt.",
+            (
+                ""
+                if py_ok
+                else "Add the Python benchmark + register in bench/python/CMakeLists.txt."
+            ),
         )
     )
 
@@ -1390,9 +1474,11 @@ def check_bench(P: OpPaths, support_info, do_run):
             "Manifest entry in bench_params.json",
             f"operators.{P.op} {'present' if in_manifest else 'MISSING'}",
             g,
-            ""
-            if in_manifest
-            else "Add the operator entry to bench/config/bench_params.json.",
+            (
+                ""
+                if in_manifest
+                else "Add the operator entry to bench/config/bench_params.json."
+            ),
         )
     )
 
@@ -1433,9 +1519,11 @@ def check_bench(P: OpPaths, support_info, do_run):
             "BEN-4",
             "bench",
             PASS if not bad_tier else GAP,
-            "Config present; all entries have a valid tier"
-            if not bad_tier
-            else "Configs with bad/missing tier: " + ",".join(bad_tier[:5]),
+            (
+                "Config present; all entries have a valid tier"
+                if not bad_tier
+                else "Configs with bad/missing tier: " + ",".join(bad_tier[:5])
+            ),
             f"{len(configs)} configs",
             g,
             "" if not bad_tier else "Set tier=basic|advanced on every config.",
@@ -1456,16 +1544,22 @@ def check_bench(P: OpPaths, support_info, do_run):
                 "BEN-5",
                 "bench",
                 NA if not unexpected_layout else GAP,
-                "layout axis not applicable to this benchmark's semantics"
-                if not unexpected_layout
-                else f"layout N-A but {len(unexpected_layout)} config(s) carry a dummy layout axis",
-                "curated layout-axis N-A classification"
-                if not unexpected_layout
-                else "unexpected: " + ", ".join(unexpected_layout[:6]),
+                (
+                    "layout axis not applicable to this benchmark's semantics"
+                    if not unexpected_layout
+                    else f"layout N-A but {len(unexpected_layout)} config(s) carry a dummy layout axis"
+                ),
+                (
+                    "curated layout-axis N-A classification"
+                    if not unexpected_layout
+                    else "unexpected: " + ", ".join(unexpected_layout[:6])
+                ),
                 g,
-                ""
-                if not unexpected_layout
-                else "Remove the misleading layout axis from these configs.",
+                (
+                    ""
+                    if not unexpected_layout
+                    else "Remove the misleading layout axis from these configs."
+                ),
             )
         )
     else:
@@ -1474,16 +1568,22 @@ def check_bench(P: OpPaths, support_info, do_run):
                 "BEN-5",
                 "bench",
                 PASS if not no_layout else GAP,
-                "layout axis on every config"
-                if not no_layout
-                else f"{len(no_layout)} config(s) missing the layout axis",
-                "all configs carry string_axes.layout"
-                if not no_layout
-                else "missing: " + ", ".join(no_layout[:6]),
+                (
+                    "layout axis on every config"
+                    if not no_layout
+                    else f"{len(no_layout)} config(s) missing the layout axis"
+                ),
+                (
+                    "all configs carry string_axes.layout"
+                    if not no_layout
+                    else "missing: " + ", ".join(no_layout[:6])
+                ),
                 g,
-                ""
-                if not no_layout
-                else 'Add a truthful "layout" axis to every config.',
+                (
+                    ""
+                    if not no_layout
+                    else 'Add a truthful "layout" axis to every config.'
+                ),
             )
         )
 
@@ -1559,16 +1659,18 @@ def check_bench(P: OpPaths, support_info, do_run):
                 summary,
                 evidence,
                 REVIEW_OP_GUIDE,
-                ""
-                if ok
-                else (
-                    "Add native NCHW and NCHW_FAKE configs (uchar4 tensor-only)."
-                    if fake_planar_applicable
+                (
+                    ""
+                    if ok
                     else (
-                        "Add native NCHW configs; NCHW_FAKE is N-A for this "
-                        "scalar/RGB-N-A tensor benchmark."
-                        if has_tensor
-                        else "Add native NCHW configs for the var-shape-only planar path."
+                        "Add native NCHW and NCHW_FAKE configs (uchar4 tensor-only)."
+                        if fake_planar_applicable
+                        else (
+                            "Add native NCHW configs; NCHW_FAKE is N-A for this "
+                            "scalar/RGB-N-A tensor benchmark."
+                            if has_tensor
+                            else "Add native NCHW configs for the var-shape-only planar path."
+                        )
                     )
                 ),
             )
@@ -1768,30 +1870,46 @@ def basic_floor(P, benched, support_info, g):
         "BEN-14",
         "bench",
         PASS if ok else GAP,
-        "Basic-tier minimum floor satisfied"
-        if ok
-        else "Basic-tier floor MISSING: " + ", ".join(missing),
+        (
+            "Basic-tier minimum floor satisfied"
+            if ok
+            else "Basic-tier floor MISSING: " + ", ".join(missing)
+        ),
         f"basic: dt={sorted(b['dtypes'])} ik={sorted(b['inputKind'])} lay={sorted(b['layout'])}",
         g,
-        ""
-        if ok
-        else "Add basic configs covering: "
-        + ", ".join(missing)
-        + " (RGB×Tensor×VarShape-if-applicable×NHWC×NCHW-if-applicable).",
+        (
+            ""
+            if ok
+            else "Add basic configs covering: "
+            + ", ".join(missing)
+            + " (RGB×Tensor×VarShape-if-applicable×NHWC×NCHW-if-applicable)."
+        ),
     )
 
 
 def baseline_completeness(P, configs, g):
-    sku = load_bench_cfg(REPO / "bench/config/sku_map.json") or {}
-    skus = sorted(e["stem"] for e in sku.get("entries", []) if "stem" in e)
-    if not skus:
+    try:
+        policies = load_sku_policies(REPO / "bench/config/sku_map.json", strict=True)
+    except BaselineError as exc:
+        return Finding(
+            "BEN-7", "bench", GAP, "Invalid baseline SKU policy", str(exc), g
+        )
+    if not policies:
         return Finding(
             "BEN-7", "bench", MANUAL, "No SKUs in sku_map.json to check against", "", g
         )
+    skus = sorted(stem for stem, policy in policies.items() if policy.required)
     missing = []
     invalid = []
     total_cases = 0
+    total_entries = 0
     for k, c in configs.items():
+        tier = c.get("tier")
+        required_skus = [
+            stem
+            for stem in skus
+            if tier not in ("basic", "advanced") or tier in policies[stem].tiers
+        ]
         bl = c.get("baselines", {})
         if not isinstance(bl, dict):
             invalid.append(f"{k}: baselines must be an object keyed by case-key")
@@ -1802,6 +1920,7 @@ def baseline_completeness(P, configs, g):
             invalid.append(f"{k}: {exc}")
             continue
         total_cases += len(expected_case_keys)
+        total_entries += len(expected_case_keys) * len(required_skus)
         for case_key in expected_case_keys:
             per_sku = bl.get(case_key)
             if per_sku is None:
@@ -1812,7 +1931,7 @@ def baseline_completeness(P, configs, g):
                     f"{case_key}: baseline case payload must be an object keyed by SKU"
                 )
                 continue
-            for s in skus:
+            for s in required_skus:
                 if s not in per_sku:
                     missing.append((case_key, s))
     if not missing and not invalid:
@@ -1820,7 +1939,7 @@ def baseline_completeness(P, configs, g):
             "BEN-7",
             "bench",
             PASS,
-            f"Baselines complete for all {total_cases} case-keys × {len(skus)} SKUs",
+            f"Baselines complete for all {total_cases} case-keys ({total_entries} required case/SKU entries)",
             f"SKUs={skus}",
             g,
         )
@@ -1844,8 +1963,8 @@ def baseline_completeness(P, configs, g):
         f"e.g. {sample}",
         g,
         "If a declared case is unsupported, remove it from the config axes; otherwise "
-        "regenerate via MR baseline-regen CI for operator '%s' + "
-        "bench/_internal/update_baseline.py — never fabricate." % P.op,
+        "regenerate via MR baseline-regen CI for operator '%s', then follow "
+        "bench/README.md 'Import, Validate, and Recheck' — never fabricate." % P.op,
     )
 
 
@@ -1867,14 +1986,18 @@ def rowcount_consistency(P, cfg, g):
             "BEN-8",
             "bench",
             PASS if ok else GAP,
-            "Row-count matches test_run_bench_config_key.py"
-            if ok
-            else f"Row-count mismatch: computed basic={basic_rows} (adv={adv_rows}) vs test {exp}",
+            (
+                "Row-count matches test_run_bench_config_key.py"
+                if ok
+                else f"Row-count mismatch: computed basic={basic_rows} (adv={adv_rows}) vs test {exp}"
+            ),
             f"computed basic_rows={basic_rows} advanced_rows={adv_rows}",
             g,
-            ""
-            if ok
-            else "Recompute and update the per-op/global counts in test_run_bench_config_key.py.",
+            (
+                ""
+                if ok
+                else "Recompute and update the per-op/global counts in test_run_bench_config_key.py."
+            ),
         )
     return Finding(
         "BEN-8",
@@ -2021,14 +2144,18 @@ def check_docs(P: OpPaths, support_info):
             "DOC-2",
             "docs",
             PASS if ok else GAP,
-            "Python autofunction directives (fn + _into)"
-            if ok
-            else "autofunction directive(s) missing",
+            (
+                "Python autofunction directives (fn + _into)"
+                if ok
+                else "autofunction directive(s) missing"
+            ),
             f"fn={'yes' if fn else 'no'} _into={'yes' if into else 'no'}",
             g,
-            ""
-            if ok
-            else f"Add cvcuda-autofunction:: cvcuda.{P.pyname}{{,_into}} to operators.rst.",
+            (
+                ""
+                if ok
+                else f"Add cvcuda-autofunction:: cvcuda.{P.pyname}{{,_into}} to operators.rst."
+            ),
         )
     )
 
@@ -2066,9 +2193,11 @@ def check_docs(P: OpPaths, support_info):
             "Python binding docstrings present" if doc else "Python docstrings missing",
             first_evidence(P.pybind, doc) or rel(P.pybind),
             g,
-            ""
-            if doc
-            else "Add pbdoc docstrings (args/returns/layouts) for the op + _into.",
+            (
+                ""
+                if doc
+                else "Add pbdoc docstrings (args/returns/layouts) for the op + _into."
+            ),
         )
     )
 
@@ -2104,16 +2233,22 @@ def check_docs(P: OpPaths, support_info):
             "DOC-7",
             "docs",
             PASS if not spdx_missing else GAP,
-            "SPDX headers present on the op's files"
-            if not spdx_missing
-            else "SPDX header missing in: " + ", ".join(spdx_missing[:4]),
-            "all checked files carry SPDX"
-            if not spdx_missing
-            else ", ".join(spdx_missing),
+            (
+                "SPDX headers present on the op's files"
+                if not spdx_missing
+                else "SPDX header missing in: " + ", ".join(spdx_missing[:4])
+            ),
+            (
+                "all checked files carry SPDX"
+                if not spdx_missing
+                else ", ".join(spdx_missing)
+            ),
             "AGENTS.md",
-            ""
-            if not spdx_missing
-            else "Add the SPDX 2026 header to the listed file(s).",
+            (
+                ""
+                if not spdx_missing
+                else "Add the SPDX 2026 header to the listed file(s)."
+            ),
         )
     )
     return out

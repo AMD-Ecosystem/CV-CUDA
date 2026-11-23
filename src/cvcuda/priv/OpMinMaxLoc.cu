@@ -17,6 +17,7 @@
 
 #include "Nvtx.hpp"
 #include "OpMinMaxLoc.hpp"
+#include "TensorAccessValidation.hpp"
 
 #include <cvcuda/cuda_tools/Atomics.hpp>
 #include <cvcuda/cuda_tools/ImageBatchVarShapeWrap.hpp>
@@ -803,6 +804,9 @@ inline void RunMinMaxLocForType(cudaStream_t stream, const DataStridedCuda &inDa
 
         CollectMinMax<BW, BH, TW, TH><<<grid2, block, 0, stream>>>(inWrap, inSize, outWrap, op);
     }
+
+    // cudaGetLastError() is sticky until read: one check here covers every launch above.
+    NVCV_CHECK_THROW(cudaGetLastError());
 }
 
 // The 2nd run layer is after exporting output data ----------------------------
@@ -1091,12 +1095,7 @@ void MinMaxLoc::operator()(cudaStream_t stream, const nvcv::Tensor &in, const nv
                               "Input tensor layout must be HW, NHW, HWC, NHWC, CHW, or NCHW");
     }
 
-    auto inData = in.exportData<nvcv::TensorDataStridedCuda>();
-    if (!inData)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Input must be cuda-accessible, pitch-linear tensor");
-    }
+    auto inData = RequireCudaTensor(in, "Input");
 
     auto inAccess = nvcv::TensorDataAccessStridedImagePlanar::Create(*inData);
     NVCV_ASSERT(inAccess);
@@ -1112,12 +1111,7 @@ void MinMaxLoc::operator()(cudaStream_t stream, const nvcv::ImageBatchVarShape &
                            const nvcv::Tensor &maxLoc, const nvcv::Tensor &numMax) const
 {
     CVCUDA_NVTX_RANGE("cvcuda::MinMaxLoc::operator()[ImageBatchVarShape]");
-    auto inData = in.exportData<nvcv::ImageBatchVarShapeDataStridedCuda>(stream);
-    if (!inData)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Input must be cuda-accessible, varshape pitch-linear image batch");
-    }
+    auto inData = RequireCudaVarShape(in, stream, "Input");
 
     nvcv::ImageFormat inFormat = inData->uniqueFormat();
 

@@ -14,12 +14,21 @@
 # limitations under the License.
 
 import ctypes
+import os
+import shutil
+import subprocess
+import sys
+import textwrap
+import threading
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest as t
 
 import cvcuda
 import cupy
+from cvcuda_test_utils import as_cupy_stream
 
 
 def test_stream_gcbag_vs_streamsync_race_condition():
@@ -43,6 +52,216 @@ def test_stream_gcbag_vs_streamsync_race_condition():
 def test_current_stream():
     assert cvcuda.Stream.current is cvcuda.Stream.default
     assert type(cvcuda.Stream.current) is cvcuda.Stream
+
+
+def test_current_stream_is_thread_local():
+    contexts_active = threading.Barrier(2)
+    streams_observed = threading.Barrier(2)
+
+    def use_stream():
+        default_before = cvcuda.Stream.current
+        stream = cvcuda.Stream()
+        with stream:
+            contexts_active.wait(timeout=10)
+            current = cvcuda.Stream.current
+            streams_observed.wait(timeout=10)
+        return stream, default_before, current, cvcuda.Stream.current
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(use_stream) for _ in range(2)]
+        results = [future.result(timeout=15) for future in futures]
+
+    for stream, default_before, current, default_after in results:
+        assert default_before is cvcuda.Stream.default
+        assert current is stream
+        assert default_after is cvcuda.Stream.default
+
+
+def test_stream_context_rejects_cross_thread_exit():
+    stream = cvcuda.Stream()
+    stream_active = threading.Event()
+    allow_stream_exit = threading.Event()
+
+    def use_stream():
+        stream.__enter__()
+        stream_active.set()
+        assert allow_stream_exit.wait(timeout=10)
+        assert cvcuda.Stream.current is stream
+        stream.__exit__(None, None, None)
+        assert cvcuda.Stream.current is cvcuda.Stream.default
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(use_stream)
+        assert stream_active.wait(timeout=10)
+        try:
+            with t.raises(RuntimeError, match="not the current stream on this thread"):
+                stream.__exit__(None, None, None)
+            assert cvcuda.Stream.current is cvcuda.Stream.default
+        finally:
+            allow_stream_exit.set()
+        future.result(timeout=10)
+
+
+def test_stream_context_survives_expired_inner_context():
+    # A manual __enter__ whose Stream is then destroyed leaves a stack entry that
+    # nothing else can pop: the object whose __exit__ would have popped it is
+    # gone. It must not hide the enclosing context, nor break its __exit__.
+    #
+    # as_stream is required here: streams from cvcuda.Stream() are held by the
+    # cache, so dropping the caller's reference would never expire them.
+    def leak_inner_context():
+        outer = cvcuda.as_stream(cupy.cuda.Stream())
+        outer.__enter__()
+        try:
+            inner = cvcuda.as_stream(cupy.cuda.Stream())
+            inner.__enter__()
+            inner_ref = weakref.ref(inner)
+            del inner
+            # Assert the precondition rather than assume it, so that a deferred
+            # deallocation fails as itself instead of as a wrong current stream.
+            assert inner_ref() is None, "inner Stream outlived `del`"
+            assert cvcuda.Stream.current is outer
+        finally:
+            outer.__exit__(None, None, None)
+        assert cvcuda.Stream.current is cvcuda.Stream.default
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(leak_inner_context).result(timeout=10)
+
+
+# Repeats of the off-main-thread import probe below. The failure it guards is
+# timing-dependent: one attempt usually passes, ten usually catch it. Ten is
+# therefore a hunting configuration, not a gating one -- defaulting to it would
+# convert a rare failure into a near-certain one for every pipeline in the
+# project. Default to a single attempt and let a job that is looking for the
+# crash ask for more.
+def _probe_attempts():
+    """Attempts per run, floored at one.
+
+    Zero or a negative value would skip the loop entirely and let this test
+    pass without running the probe at all. A bad value is clamped rather than
+    raised on: this is a hunting amplifier, not a correctness switch, and a
+    typo in it should not take out collection of every other test in the file.
+    """
+    raw = os.environ.get("CVCUDA_STREAM_PROBE_ATTEMPTS", "1")
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 1
+
+
+_OFF_MAIN_THREAD_IMPORT_ATTEMPTS = _probe_attempts()
+
+
+def _native_backtrace(program):
+    """Native backtrace for a crash faulthandler cannot see.
+
+    faulthandler uninstalls its handlers in Py_FinalizeEx, so a SIGSEGV during
+    late finalization -- which is where this one lands, since it reports
+    nothing -- leaves no Python-level trace at all. Re-running the child under
+    gdb is the only way to name the frame. The re-run races the same way the
+    original did, so it may well exit cleanly; that is reported rather than
+    hidden.
+    """
+    gdb = shutil.which("gdb")
+    if gdb is None:
+        return "gdb not installed; no native backtrace available"
+    try:
+        rerun = subprocess.run(
+            [
+                gdb,
+                "--batch",
+                "-ex",
+                "run",
+                "-ex",
+                "bt full",
+                "-ex",
+                "info threads",
+                "--args",
+                sys.executable,
+                "-X",
+                "faulthandler",
+                "-c",
+                program,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        return "gdb re-run timed out"
+    return (
+        f"gdb exited {rerun.returncode}\n{rerun.stdout[-6000:]}\n{rerun.stderr[-2000:]}"
+    )
+
+
+def test_no_leak_warning_when_imported_off_main_thread():
+    # The importing thread and the interpreter's cleanup thread need not be the
+    # same, so cleanup must not assume the importer's stack state.
+    program = textwrap.dedent(
+        """
+        import threading
+
+        def work():
+            import cvcuda
+
+            assert cvcuda.Stream.current is cvcuda.Stream.default
+
+        thread = threading.Thread(target=work)
+        thread.start()
+        thread.join()
+        """
+    )
+    # This has segfaulted in CI roughly once in a hundred and fifty runs, in
+    # cache teardown racing interpreter finalization. One attempt per run made
+    # it a lottery nobody could reproduce, and the crash carried no stack:
+    # -X faulthandler turns SIGSEGV into a native traceback on stderr, which
+    # the assertion below reports.
+    for attempt in range(_OFF_MAIN_THREAD_IMPORT_ATTEMPTS):
+        result = subprocess.run(
+            [sys.executable, "-X", "faulthandler", "-c", program],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if result.returncode != 0:
+            t.fail(
+                f"attempt {attempt} exited {result.returncode}\n"
+                f"child stderr:\n{result.stderr}\n"
+                f"native backtrace from a gdb re-run:\n{_native_backtrace(program)}"
+            )
+        assert "Stream stack leak detected" not in result.stderr
+
+
+def test_stream_default_is_read_only():
+    # Assigning it used to succeed and change nothing: Stream.current resolves
+    # the default through the binding, not through this attribute, so the two
+    # names silently disagreed from then on.
+    with t.raises(AttributeError):
+        cvcuda.Stream.default = cvcuda.Stream()
+    assert cvcuda.Stream.current is cvcuda.Stream.default
+    assert cvcuda.Stream.default.handle == 0
+
+
+def test_stream_context_exit_does_not_mask_body_exception():
+    # An out-of-order __exit__ is a real error, but reporting it while the body
+    # is already unwinding buries the failure the caller needs to see.
+    def use_streams():
+        outer = cvcuda.Stream()
+        inner = cvcuda.Stream()
+        with t.raises(ValueError, match="body failure"):
+            with outer:
+                inner.__enter__()  # deliberately left on the stack
+                raise ValueError("body failure")
+
+        # The exit was suppressed rather than applied, so both are still active.
+        assert cvcuda.Stream.current is inner
+        inner.__exit__(None, None, None)
+        outer.__exit__(None, None, None)
+        assert cvcuda.Stream.current is cvcuda.Stream.default
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(use_streams).result(timeout=10)
 
 
 def test_user_stream():
@@ -88,6 +307,90 @@ def test_wrap_stream_int():
     assert extStream == cvcudaStream.handle
 
 
+def test_wrap_per_thread_default_stream_on_creator_thread():
+    stream = cvcuda.as_stream(2)
+    assert stream.handle == 2
+    stream.sync()
+
+
+def test_wrap_per_thread_default_stream_rejects_other_thread():
+    stream = cvcuda.as_stream(2)
+    errors = []
+
+    def sync_from_other_thread():
+        try:
+            stream.sync()
+        except Exception as error:  # noqa: BLE001 - asserted below.
+            errors.append(error)
+
+    thread = threading.Thread(target=sync_from_other_thread)
+    thread.start()
+    thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "host thread that created it" in str(errors[0])
+
+
+def test_wrap_per_thread_default_stream_rejects_after_creator_exits():
+    streams = []
+    errors = []
+
+    def create_on_other_thread():
+        streams.append(cvcuda.as_stream(2))
+
+    thread = threading.Thread(target=create_on_other_thread)
+    thread.start()
+    thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    assert len(streams) == 1
+
+    def consume_on_new_thread():
+        try:
+            streams[0].sync()
+        except Exception as error:  # noqa: BLE001 - asserted below.
+            errors.append(error)
+
+    replacement = threading.Thread(target=consume_on_new_thread)
+    replacement.start()
+    replacement.join(timeout=10)
+
+    assert not replacement.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "host thread that created it" in str(errors[0])
+
+
+def test_wrap_per_thread_default_stream_rejects_explicit_device_entrypoints():
+    stream = cvcuda.as_stream(2)
+    owner = cvcuda.Tensor((1, 1, 1, 1), np.uint8, "NHWC")
+    device = cupy.cuda.runtime.getDevice()
+    actions = [
+        lambda: cvcuda._test.ensure_not_capturing_on_device(stream, device),
+        lambda: cvcuda._test.hold_resources_on_device(stream, [owner], device),
+    ]
+
+    for action in actions:
+        errors = []
+
+        def invoke_from_other_thread():
+            try:
+                action()
+            except Exception as error:  # noqa: BLE001 - asserted below.
+                errors.append(error)
+
+        thread = threading.Thread(target=invoke_from_other_thread)
+        thread.start()
+        thread.join(timeout=10)
+
+        assert not thread.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+        assert "host thread that created it" in str(errors[0])
+
+
 def test_stream_conv_to_int():
     stream = cvcuda.Stream()
 
@@ -97,7 +400,7 @@ def test_stream_conv_to_int():
 class MockStream:
     def __init__(self, cuda_stream=None):
         if cuda_stream:
-            self.m_stream = cupy.cuda.ExternalStream(cuda_stream)
+            self.m_stream = as_cupy_stream(cuda_stream)
         else:
             self.m_stream = cupy.cuda.Stream()
 

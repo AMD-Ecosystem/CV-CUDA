@@ -24,6 +24,10 @@
 #include <cvcuda/cuda_tools/TypeTraits.hpp>   // for BaseType, etc.
 #include <nvcv/util/Assert.h>                 // for NVCV_ASSERT, etc.
 
+#include <limits>
+#include <stdexcept>
+#include <type_traits>
+
 namespace nvcv::test {
 
 namespace detail {
@@ -53,13 +57,25 @@ inline T MakeConvolveBorderValue(const float4 &borderValue)
     return borderValueT;
 }
 
+// Seeds the running min/max of Morph below (above) every representable value, so that only real
+// samples can win. lowest(), not min(): for a floating-point BT the latter is the smallest positive
+// normal, which is larger than every negative sample. cf.
+// OpMorphology.dilate_f32_all_negative_neighborhood.
 template<typename T>
 inline T MakeMorphBorderValue(NVCVMorphologyType type)
 {
     using BT = cuda::BaseType<T>;
 
-    BT val
-        = (type == NVCVMorphologyType::NVCV_DILATE) ? std::numeric_limits<BT>::min() : std::numeric_limits<BT>::max();
+    BT val;
+    if constexpr (std::is_same_v<BT, __half>)
+    {
+        val = (type == NVCVMorphologyType::NVCV_DILATE) ? cuda::HalfLowest() : cuda::HalfMax();
+    }
+    else
+    {
+        val = (type == NVCVMorphologyType::NVCV_DILATE) ? std::numeric_limits<BT>::lowest()
+                                                        : std::numeric_limits<BT>::max();
+    }
     T borderValueT;
     for (int e = 0; e < cuda::NumElements<T>; ++e)
     {
@@ -119,7 +135,8 @@ inline auto ConvolvePixel(const ConvolveRefData<T> &ref, int b, int y, int x)
     {
         for (int kx = 0; kx < ref.kernelSize.w; ++kx)
         {
-            res += ConvolveSourceValue(ref, b, y, x, ky, kx) * ref.kernel[ky * ref.kernelSize.w + kx];
+            res += cuda::StaticCast<std::common_type_t<BT, float>>(ConvolveSourceValue(ref, b, y, x, ky, kx))
+                 * ref.kernel[ky * ref.kernelSize.w + kx];
         }
     }
 
@@ -232,7 +249,32 @@ NVCV_TEST_INST(float);
 
 #undef NVCV_TEST_INST
 
+#define NVCV_TEST_INST_HALF_MORPH(TYPE)                                                                               \
+    template void Morph<TYPE>(std::vector<uint8_t> & hDst, const long3 &dstStrides, const std::vector<uint8_t> &hSrc, \
+                              const long3 &srcStrides, const int3 &shape, const Size2D &kernelSize,                   \
+                              int2 &kernelAnchor, const NVCVBorderType &borderMode, NVCVMorphologyType type)
+
+NVCV_TEST_INST_HALF_MORPH(__half);
+NVCV_TEST_INST_HALF_MORPH(__half2);
+NVCV_TEST_INST_HALF_MORPH(half3);
+NVCV_TEST_INST_HALF_MORPH(half4);
+
+#undef NVCV_TEST_INST_HALF_MORPH
+
 } // namespace detail
+
+ImageFormat EquivalentFloatFormat(const ImageFormat &format)
+{
+    switch (format.numChannels())
+    {
+    case 1:
+        return FMT_F32;
+    case 3:
+        return FMT_RGBf32;
+    default:
+        return FMT_RGBAf32;
+    }
+}
 
 void Convolve(std::vector<uint8_t> &hDst, const long3 &dstStrides, const std::vector<uint8_t> &hSrc,
               const long3 &srcStrides, const int3 &shape, const ImageFormat &format, const std::vector<float> &kernel,
@@ -250,6 +292,14 @@ void Convolve(std::vector<uint8_t> &hDst, const long3 &dstStrides, const std::ve
 
         NVCV_TEST_CASE(U8, uint8_t);
         NVCV_TEST_CASE(U16, ushort);
+        NVCV_TEST_CASE(3U16, ushort3);
+        NVCV_TEST_CASE(4U16, ushort4);
+        NVCV_TEST_CASE(S16, short);
+        NVCV_TEST_CASE(3S16, short3);
+        NVCV_TEST_CASE(4S16, short4);
+        NVCV_TEST_CASE(S32, int);
+        NVCV_TEST_CASE(3S32, int3);
+        NVCV_TEST_CASE(4S32, int4);
         NVCV_TEST_CASE(3U8, uchar3);
         NVCV_TEST_CASE(4U8, uchar4);
         NVCV_TEST_CASE(4F32, float4);
@@ -278,6 +328,8 @@ void Morph(std::vector<uint8_t> &hDst, const long3 &dstStrides, const std::vecto
 
         NVCV_TEST_CASE(U8, uint8_t);
         NVCV_TEST_CASE(U16, ushort);
+        NVCV_TEST_CASE(3U16, ushort3);
+        NVCV_TEST_CASE(4U16, ushort4);
         NVCV_TEST_CASE(3U8, uchar3);
         NVCV_TEST_CASE(4U8, uchar4);
         NVCV_TEST_CASE(4F32, float4);
@@ -285,8 +337,23 @@ void Morph(std::vector<uint8_t> &hDst, const long3 &dstStrides, const std::vecto
 
 #undef NVCV_TEST_CASE
 
+#define NVCV_TEST_HALF_CASE(DATATYPE, TYPE)                                                                   \
+    case NVCV_DATA_TYPE_##DATATYPE:                                                                           \
+    {                                                                                                         \
+        int2 anchor = kernelAnchor;                                                                           \
+        detail::Morph<TYPE>(hDst, dstStrides, hSrc, srcStrides, shape, kernelSize, anchor, borderMode, type); \
+        break;                                                                                                \
+    }
+
+        NVCV_TEST_HALF_CASE(F16, __half)
+        NVCV_TEST_HALF_CASE(2F16, __half2)
+        NVCV_TEST_HALF_CASE(3F16, half3)
+        NVCV_TEST_HALF_CASE(4F16, half4)
+
+#undef NVCV_TEST_HALF_CASE
+
     default:
-        break;
+        throw std::invalid_argument("Morph has no implementation for this data type");
     }
 }
 

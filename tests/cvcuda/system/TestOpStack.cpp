@@ -26,6 +26,7 @@
 #include <nvcv/TensorDataAccess.hpp>
 
 #include <iostream>
+#include <limits>
 #include <random>
 
 namespace gt   = ::testing;
@@ -249,6 +250,260 @@ TEST(OpStack_Negative, invalid_parameters)
     ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
 }
 
+TEST(OpStack_Negative, tensor_batch_rejects_input_rank_and_layout)
+{
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+
+    cvcuda::Stack op;
+    nvcv::Tensor  out(1, {7, 5}, nvcv::FMT_U8);
+
+    auto              reqs = nvcv::TensorBatch::CalcRequirements(1);
+    nvcv::TensorBatch rankBatch(reqs);
+    nvcv::Tensor      rankTwo(
+             {
+                 {5, 7},
+                 "HW"
+    },
+             nvcv::TYPE_U8);
+    rankBatch.pushBack(rankTwo);
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT, nvcv::ProtectCall([&] { op(stream, rankBatch, out); }));
+
+    nvcv::TensorBatch layoutBatch(reqs);
+    nvcv::Tensor      invalidLayout(
+             {
+                 {7, 5, 1},
+                 "WHC"
+    },
+             nvcv::TYPE_U8);
+    layoutBatch.pushBack(invalidLayout);
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT, nvcv::ProtectCall([&] { op(stream, layoutBatch, out); }));
+
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+TEST(OpStack_Negative, tensor_batch_rejects_output_layout)
+{
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+
+    auto              reqs = nvcv::TensorBatch::CalcRequirements(1);
+    nvcv::TensorBatch in(reqs);
+    in.pushBack(nvcv::Tensor(
+        {
+            {5, 7, 1},
+            "HWC"
+    },
+        nvcv::TYPE_U8));
+    nvcv::Tensor out(
+        {
+            {1, 5, 7, 1},
+            "WHCN"
+    },
+        nvcv::TYPE_U8);
+
+    cvcuda::Stack op;
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT, nvcv::ProtectCall([&] { op(stream, in, out); }));
+
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+TEST(OpStack, tensor_batch_large_height_fallback_correct_output)
+{
+    constexpr int width  = 1;
+    constexpr int height = 65536;
+
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+
+    nvcv::Tensor input(
+        {
+            {height, width, 1},
+            "HWC"
+    },
+        nvcv::TYPE_U8);
+    std::vector<uint8_t> inputValues(height);
+    for (int i = 0; i < height; ++i)
+    {
+        inputValues[i] = static_cast<uint8_t>(i);
+    }
+    ASSERT_NO_THROW(util::SetImageTensorFromVector<uint8_t>(input.exportData(), inputValues, 0));
+
+    auto              reqs = nvcv::TensorBatch::CalcRequirements(1);
+    nvcv::TensorBatch in(reqs);
+    in.pushBack(input);
+    nvcv::Tensor out(1, {width, height}, nvcv::FMT_U8);
+
+    cvcuda::Stack op;
+    ASSERT_NO_THROW(op(stream, in, out));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+
+    std::vector<uint8_t> outputValues;
+    ASSERT_NO_THROW(util::GetImageVectorFromTensor(out.exportData(), 0, outputValues));
+    EXPECT_EQ(inputValues, outputValues);
+
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+TEST(OpStack, varshape_large_height_fallback_correct_output)
+{
+    constexpr int width  = 1;
+    constexpr int height = 65536;
+
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+
+    nvcv::Image image(nvcv::Size2D{width, height}, nvcv::FMT_U8);
+    auto        imageData = image.exportData<nvcv::ImageDataStridedCuda>();
+    ASSERT_NE(imageData, nullptr);
+
+    std::vector<uint8_t> inputValues(height);
+    for (int i = 0; i < height; ++i)
+    {
+        inputValues[i] = static_cast<uint8_t>(i);
+    }
+
+    const NVCVImageBufferStrided &buffer = imageData->cdata().buffer.strided;
+    ASSERT_EQ(1, buffer.numPlanes);
+    const NVCVImagePlaneStrided &plane = buffer.planes[0];
+    ASSERT_EQ(cudaSuccess, cudaMemcpy2D(plane.basePtr, plane.rowStride, inputValues.data(), width, width, height,
+                                        cudaMemcpyHostToDevice));
+
+    nvcv::ImageBatchVarShape inBatch(1);
+    inBatch.pushBack(image);
+    nvcv::Tensor outTensor(1, {width, height}, nvcv::FMT_U8);
+
+    cvcuda::Stack op;
+    ASSERT_NO_THROW(op(stream, inBatch, outTensor));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+
+    std::vector<uint8_t> outputValues;
+    ASSERT_NO_THROW(util::GetImageVectorFromTensor(outTensor.exportData(), 0, outputValues));
+    EXPECT_EQ(inputValues, outputValues);
+
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+TEST(OpStack, varshape_fast_path_matching_plane_shape)
+{
+    constexpr int width  = 5;
+    constexpr int height = 3;
+
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+
+    nvcv::Image image(nvcv::Size2D{width, height}, nvcv::FMT_U8);
+    auto        imageData = image.exportData<nvcv::ImageDataStridedCuda>();
+    ASSERT_NE(imageData, nullptr);
+
+    const NVCVImageBufferStrided &buffer = imageData->cdata().buffer.strided;
+    ASSERT_EQ(1, buffer.numPlanes);
+    const NVCVImagePlaneStrided &plane = buffer.planes[0];
+
+    const std::vector<uint8_t> inputValues = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+    ASSERT_EQ(cudaSuccess, cudaMemcpy2D(plane.basePtr, plane.rowStride, inputValues.data(), width, width, height,
+                                        cudaMemcpyHostToDevice));
+
+    nvcv::ImageBatchVarShape inBatch(1);
+    inBatch.pushBack(image);
+    nvcv::Tensor outTensor(1, {width, height}, nvcv::FMT_U8);
+
+    cvcuda::Stack op;
+    ASSERT_NO_THROW(op(stream, inBatch, outTensor));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+
+    std::vector<uint8_t> outputValues;
+    ASSERT_NO_THROW(util::GetImageVectorFromTensor(outTensor.exportData(), 0, outputValues));
+    EXPECT_EQ(inputValues, outputValues);
+
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+TEST(OpStackKernels, guard_paths_reject_invalid_descriptors)
+{
+    cvcuda::Stack op;
+    nvcv::Tensor  output(
+         {
+             {1, 1, 1, 1},
+             "NCHW"
+    },
+         nvcv::TYPE_U8);
+
+    nvcv::Tensor invalidRankTensor(
+        {
+            {1, 1},
+            "NC"
+    },
+        nvcv::TYPE_U8);
+    nvcv::TensorBatch invalidRankBatch(1);
+    invalidRankBatch.pushBack(invalidRankTensor);
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT, nvcv::ProtectCall([&] { op(nullptr, invalidRankBatch, output); }));
+
+    nvcv::Tensor validTensor(
+        {
+            {1, 1, 1},
+            "CHW"
+    },
+        nvcv::TYPE_U8);
+    nvcv::TensorBatch validBatch(1);
+    validBatch.pushBack(validTensor);
+    nvcv::Tensor invalidOutput({{1}, "N"}, nvcv::TYPE_U8);
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT, nvcv::ProtectCall([&] { op(nullptr, validBatch, invalidOutput); }));
+
+    nvcv::ImageBatchVarShape imageBatch(1);
+    imageBatch.pushBack(nvcv::Image(nvcv::Size2D{2, 1}, nvcv::FMT_U8));
+    nvcv::Tensor mismatchedOutput(1, {1, 1}, nvcv::FMT_U8);
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT, nvcv::ProtectCall([&] { op(nullptr, imageBatch, mismatchedOutput); }));
+}
+
+TEST(OpStackKernels, valid_descriptors_exercise_fast_paths)
+{
+    constexpr int width  = 3;
+    constexpr int height = 2;
+
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+
+    std::vector<uint8_t> expected    = {1, 2, 3, 4, 5, 6};
+    nvcv::Tensor         tensorInput = util::CreateTensor(1, width, height, nvcv::FMT_U8);
+    ASSERT_NO_THROW(util::SetImageTensorFromVector<uint8_t>(tensorInput.exportData(), expected));
+
+    auto              tensorBatchReqs = nvcv::TensorBatch::CalcRequirements(1);
+    nvcv::TensorBatch tensorBatch(tensorBatchReqs);
+    tensorBatch.pushBack(tensorInput);
+    nvcv::Tensor tensorOutput = util::CreateTensor(2, width, height, nvcv::FMT_U8);
+
+    cvcuda::Stack op;
+    ASSERT_NO_THROW(op(stream, tensorBatch, tensorOutput));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+
+    std::vector<uint8_t> tensorOutputValues;
+    ASSERT_NO_THROW(util::GetImageVectorFromTensor(tensorOutput.exportData(), 0, tensorOutputValues));
+    EXPECT_EQ(expected, tensorOutputValues);
+
+    nvcv::Image image(nvcv::Size2D{width, height}, nvcv::FMT_U8);
+    auto        imageData = image.exportData<nvcv::ImageDataStridedCuda>();
+    ASSERT_NE(imageData, nullptr);
+    const NVCVImagePlaneStrided &plane = imageData->cdata().buffer.strided.planes[0];
+    ASSERT_EQ(cudaSuccess, cudaMemcpy2D(plane.basePtr, plane.rowStride, expected.data(), width, width, height,
+                                        cudaMemcpyHostToDevice));
+
+    nvcv::ImageBatchVarShape imageBatch(1);
+    imageBatch.pushBack(image);
+    nvcv::Tensor imageOutput(1, {width, height}, nvcv::FMT_U8);
+
+    ASSERT_NO_THROW(op(stream, imageBatch, imageOutput));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+
+    std::vector<uint8_t> imageOutputValues;
+    ASSERT_NO_THROW(util::GetImageVectorFromTensor(imageOutput.exportData(), 0, imageOutputValues));
+    EXPECT_EQ(expected, imageOutputValues);
+
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
 TEST_P(OpStack, varshape_correct_output)
 {
     cudaStream_t stream;
@@ -392,4 +647,34 @@ TEST(OpStack_Negative, varshape_plane_mismatch_does_not_access_missing_planes)
 
     ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
     ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+TEST(OpStack_Negative, varshape_rejects_non_image_output_layout)
+{
+    nvcv::ImageBatchVarShape inBatch(1);
+    inBatch.pushBack(nvcv::Image({24, 16}, nvcv::FMT_U8));
+    nvcv::Tensor outTensor(
+        {
+            {1, 16, 24, 1},
+            "NHCW"
+    },
+        nvcv::TYPE_U8);
+
+    cvcuda::Stack op;
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT, nvcv::ProtectCall([&] { op(nullptr, inBatch, outTensor); }));
+}
+
+TEST(OpStack_Negative, varshape_rejects_planar_plane_channel_mismatch)
+{
+    nvcv::ImageBatchVarShape inBatch(1);
+    inBatch.pushBack(nvcv::Image({24, 16}, nvcv::FMT_RGB8p));
+    nvcv::Tensor outTensor(
+        {
+            {1, 4, 16, 24},
+            "NCHW"
+    },
+        nvcv::TYPE_U8);
+
+    cvcuda::Stack op;
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT, nvcv::ProtectCall([&] { op(nullptr, inBatch, outTensor); }));
 }

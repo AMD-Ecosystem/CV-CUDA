@@ -15,7 +15,12 @@
  * limitations under the License.
  */
 
+#include "CudaDeviceUtils.hpp"
 #include "OpAdjustSaturation.hpp"
+#include "TensorAccessValidation.hpp"
+
+#include "ChannelAxisCommon.cuh"
+#include "ElementStreamCommon.cuh"
 
 #include <cvcuda/cuda_tools/ImageBatchVarShapeWrap.hpp>
 #include <cvcuda/cuda_tools/MathOps.hpp>
@@ -36,8 +41,10 @@
 
 #include <type_traits>
 
-namespace cuda = nvcv::cuda;
-namespace util = nvcv::util;
+namespace cuda         = nvcv::cuda;
+namespace util         = nvcv::util;
+namespace channel_axis = cvcuda::priv::channel_axis;
+namespace elem_stream  = cvcuda::priv::elem_stream;
 
 namespace {
 
@@ -46,19 +53,16 @@ constexpr float kR2Y = 0.2989f;
 constexpr float kG2Y = 0.587f;
 constexpr float kB2Y = 0.114f;
 
-static bool IsPlanarLayout(nvcv::TensorLayout layout)
-{
-    return layout == nvcv::TENSOR_NCHW || layout == nvcv::TENSOR_CHW;
-}
-
 // Clamp + store to the output element type. Integers truncate toward zero (matching torchvision's
 // `.to(uint8)`): round<ZERO> drops the fractional part and SaturateCast clamps into the dtype range,
-// the same sequence cvcuda's ConvertTo uses for NVCV_ROUND_TRUNCATE (priv/legacy/convert_to.cu).
-// Floats clamp to [0, 1] with no rounding.
+// the same sequence cvcuda's ConvertTo uses for NVCV_ROUND_TRUNCATE (priv/OpConvertTo.cu).
+// Floats clamp to [0, 1] with no rounding. __half shares the float [0, 1] semantics but is not
+// classified by std::is_floating_point, so it is routed explicitly — it must not take the integer
+// truncation path.
 template<typename BT>
 inline __host__ __device__ BT StoreSaturation(float v)
 {
-    if constexpr (std::is_floating_point_v<BT>)
+    if constexpr (cuda::detail::IsFloatingPointV<BT>)
     {
         return static_cast<BT>(fminf(fmaxf(v, 0.0f), 1.0f));
     }
@@ -66,6 +70,26 @@ inline __host__ __device__ BT StoreSaturation(float v)
     {
         return cuda::SaturateCast<BT>(cuda::round<cuda::RoundMode::ZERO>(v));
     }
+}
+
+template<typename BT>
+inline __host__ __device__ void AdjustSaturationChannels(BT r, BT g, BT b, float ratio, float oneMinus, BT &outR,
+                                                         BT &outG, BT &outB)
+{
+    const float fr = static_cast<float>(r);
+    const float fg = static_cast<float>(g);
+    const float fb = static_cast<float>(b);
+
+    float gray = (kR2Y * fr + kG2Y * fg) + kB2Y * fb;
+    // Match torchvision: floor integer grayscale before blending, but never floor __half or other floats.
+    if constexpr (!cuda::detail::IsFloatingPointV<BT>)
+    {
+        gray = floorf(gray);
+    }
+
+    outR = StoreSaturation<BT>(ratio * fr + oneMinus * gray);
+    outG = StoreSaturation<BT>(ratio * fg + oneMinus * gray);
+    outB = StoreSaturation<BT>(ratio * fb + oneMinus * gray);
 }
 
 // Core per-pixel saturation blend, shared by the interleaved and planar paths (and mirrored by the
@@ -85,22 +109,32 @@ inline __host__ __device__ T AdjustSaturationPixel(T pixel, float ratio, float o
     else
     {
         static_assert(numChans == 3, "AdjustSaturation supports 1- or 3-channel pixels");
-        const float r = static_cast<float>(cuda::GetElement(pixel, 0));
-        const float g = static_cast<float>(cuda::GetElement(pixel, 1));
-        const float b = static_cast<float>(cuda::GetElement(pixel, 2));
-
-        float gray = (kR2Y * r + kG2Y * g) + kB2Y * b;
-        if constexpr (!std::is_floating_point_v<BT>)
-        {
-            gray = floorf(gray); // torchvision floors the grayscale for integer dtypes before the blend
-        }
-
-        cuda::GetElement(out, 0) = StoreSaturation<BT>(ratio * r + oneMinus * gray);
-        cuda::GetElement(out, 1) = StoreSaturation<BT>(ratio * g + oneMinus * gray);
-        cuda::GetElement(out, 2) = StoreSaturation<BT>(ratio * b + oneMinus * gray);
+        AdjustSaturationChannels<BT>(cuda::GetElement(pixel, 0), cuda::GetElement(pixel, 1), cuda::GetElement(pixel, 2),
+                                     ratio, oneMinus, cuda::GetElement(out, 0), cuda::GetElement(out, 1),
+                                     cuda::GetElement(out, 2));
     }
     return out;
 }
+
+struct SaturationGroupOp
+{
+    // Keep enough U8 groups resident; the stream caps this request to each SM's thread capacity.
+    static constexpr int kMinBlocksPerMP = 8;
+
+    struct Param
+    {
+        float ratio;
+        float oneMinus;
+    };
+
+    template<typename BT>
+    inline static __device__ void Channels(BT r, BT g, BT b, const Param &p, BT &outR, BT &outG, BT &outB)
+    {
+        AdjustSaturationChannels<BT>(r, g, b, p.ratio, p.oneMinus, outR, outG, outB);
+    }
+};
+
+inline constexpr int kSatGroupBytes = 16;
 
 // Interleaved ((N)HWC) kernels ----------------------------------------------------------
 
@@ -207,6 +241,69 @@ inline void RunTensor(cudaStream_t stream, const nvcv::TensorDataStridedCuda &sr
                               cuda::TypeTraits<int32_t>::max);
     }
 
+    if constexpr (numChannels == 3)
+    {
+        const SaturationGroupOp::Param param{ratio, oneMinus};
+        bool                           ranGroup  = false;
+        bool                           useGroups = true;
+        if constexpr (sizeof(BT) == 1)
+        {
+            int sm = 0;
+            NVCV_CHECK_THROW(cvcuda::priv::GetCurrentDeviceSM(sm));
+            if (sm == 86)
+            {
+                ranGroup = isPlanar ? elem_stream::TryRunPixelGroup<8, BT, true, SaturationGroupOp>(
+                               stream, srcData, dstData, *srcAccess, *dstAccess, param)
+                                    : elem_stream::TryRunPixelGroup<8, BT, false, SaturationGroupOp>(
+                                        stream, srcData, dstData, *srcAccess, *dstAccess, param);
+                if (ranGroup)
+                {
+                    return;
+                }
+            }
+            const auto fitsLegacy = [](const nvcv::TensorDataStridedCuda &data)
+            {
+                int64_t remaining = cuda::TypeTraits<int32_t>::max;
+                for (int dimension = 0; dimension < data.rank(); ++dimension)
+                {
+                    const int64_t steps  = data.shape(dimension) - 1;
+                    const int64_t stride = data.stride(dimension);
+                    if (stride < 0 || stride > cuda::TypeTraits<int32_t>::max)
+                        return false;
+                    if (steps > 0)
+                    {
+                        if (stride > remaining / steps)
+                            return false;
+                        remaining -= steps * stride;
+                    }
+                }
+                return true;
+            };
+            useGroups
+                = sm != 89 || size.y > elem_stream::kMaxGridYZ * 4 || !fitsLegacy(srcData) || !fitsLegacy(dstData);
+        }
+        if (useGroups)
+        {
+            if (isPlanar)
+            {
+                ranGroup = elem_stream::TryRunPixelGroup<kSatGroupBytes, BT, true, SaturationGroupOp>(
+                    stream, srcData, dstData, *srcAccess, *dstAccess, param);
+            }
+            else
+            {
+                if constexpr (sizeof(BT) == 1)
+                {
+                    ranGroup = elem_stream::TryRunPixelGroup<kSatGroupBytes, BT, false, SaturationGroupOp>(
+                        stream, srcData, dstData, *srcAccess, *dstAccess, param);
+                }
+            }
+        }
+        if (ranGroup)
+        {
+            return;
+        }
+    }
+
     const dim3 block(32, 4, 1);
     const dim3 grid(util::DivUp(size.x, block.x), util::DivUp(size.y, block.y),
                     static_cast<unsigned int>(srcAccess->numSamples()));
@@ -228,12 +325,35 @@ inline void RunTensor(cudaStream_t stream, const nvcv::TensorDataStridedCuda &sr
 
 template<typename T, int numChannels>
 inline void RunVarShape(cudaStream_t stream, const nvcv::ImageBatchVarShapeDataStridedCuda &srcData,
-                        const nvcv::ImageBatchVarShapeDataStridedCuda &dstData, bool isPlanar, float ratio,
-                        float oneMinus)
+                        const nvcv::ImageBatchVarShapeDataStridedCuda &dstData, bool isPlanar,
+                        const elem_stream::GroupBatchInfo &groupInfo, float ratio, float oneMinus)
 {
     using BT = cuda::BaseType<T>;
 
     CheckBatchLimit(dstData.numImages());
+
+    if constexpr (numChannels == 3)
+    {
+        const SaturationGroupOp::Param param{ratio, oneMinus};
+        bool                           ranGroup = false;
+        if (isPlanar)
+        {
+            ranGroup = elem_stream::TryRunPixelGroupVarShape<kSatGroupBytes, BT, true, SaturationGroupOp>(
+                stream, srcData, dstData, groupInfo, param);
+        }
+        else
+        {
+            if constexpr (sizeof(BT) == 1)
+            {
+                ranGroup = elem_stream::TryRunPixelGroupVarShape<kSatGroupBytes, BT, false, SaturationGroupOp>(
+                    stream, srcData, dstData, groupInfo, param);
+            }
+        }
+        if (ranGroup)
+        {
+            return;
+        }
+    }
 
     const int3 dstMaxSize{dstData.maxSize().w, dstData.maxSize().h, dstData.numImages()};
     const dim3 block(32, 4, 1);
@@ -255,18 +375,20 @@ inline void RunVarShape(cudaStream_t stream, const nvcv::ImageBatchVarShapeDataS
     NVCV_CHECK_THROW(cudaGetLastError());
 }
 
-// Dispatch over base dtype (u8 / f32) and channel count (1 / 3) -------------------------
+// Dispatch over base dtype (u8 / f16 / f32) and channel count (1 / 3) -------------------
 
 template<typename Cb>
 inline void RunChannelSwitch(int numChannels, nvcv::DataType dtype, const Cb &cb)
 {
     const bool isU8  = (dtype == nvcv::TYPE_U8 || dtype == nvcv::TYPE_3U8);
+    const bool isF16 = (dtype == nvcv::TYPE_F16 || dtype == nvcv::TYPE_3F16);
     const bool isF32 = (dtype == nvcv::TYPE_F32 || dtype == nvcv::TYPE_3F32);
 
-    if (!isU8 && !isF32)
+    if (!isU8 && !isF16 && !isF32)
     {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Invalid data type: AdjustSaturation supports 8-bit unsigned and 32-bit float");
+        throw nvcv::Exception(
+            nvcv::Status::ERROR_INVALID_ARGUMENT,
+            "Invalid data type: AdjustSaturation supports 8-bit unsigned, 16-bit float and 32-bit float");
     }
 
     if (numChannels == 1)
@@ -274,6 +396,10 @@ inline void RunChannelSwitch(int numChannels, nvcv::DataType dtype, const Cb &cb
         if (isU8)
         {
             cb(uchar1{}, std::integral_constant<int, 1>{});
+        }
+        else if (isF16)
+        {
+            cb(half1{}, std::integral_constant<int, 1>{});
         }
         else
         {
@@ -285,6 +411,10 @@ inline void RunChannelSwitch(int numChannels, nvcv::DataType dtype, const Cb &cb
         if (isU8)
         {
             cb(uchar3{}, std::integral_constant<int, 3>{});
+        }
+        else if (isF16)
+        {
+            cb(half3{}, std::integral_constant<int, 3>{});
         }
         else
         {
@@ -308,214 +438,6 @@ inline void ValidateSaturation(double saturation)
     }
 }
 
-inline bool ValidateSrcDstTensors(bool &isEmpty, int &numChannels, nvcv::DataType &dtype,
-                                  const nvcv::Optional<nvcv::TensorDataStridedCuda> &srcData,
-                                  const nvcv::Optional<nvcv::TensorDataStridedCuda> &dstData)
-{
-    if (!srcData)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Input must be cuda-accessible, pitch-linear tensor");
-    }
-    if (!dstData)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Output must be cuda-accessible, pitch-linear tensor");
-    }
-    if (srcData->layout() != dstData->layout())
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Input and output must have the same layout");
-    }
-
-    const bool isPlanar = IsPlanarLayout(srcData->layout());
-    if (srcData->layout() != nvcv::TENSOR_HWC && srcData->layout() != nvcv::TENSOR_NHWC && !isPlanar)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Input must have (N)HWC or (N)CHW layout");
-    }
-    if (srcData->dtype() != dstData->dtype())
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Input and output must have the same data type");
-    }
-    if (srcData->dtype().numChannels() != 1)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Tensor data type must be scalar; use the C dimension for image channels");
-    }
-
-    auto srcAccess = nvcv::TensorDataAccessStridedImagePlanar::Create(*srcData);
-    auto dstAccess = nvcv::TensorDataAccessStridedImagePlanar::Create(*dstData);
-    if (!srcAccess || !dstAccess)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Input/output must be accessible as strided images");
-    }
-    if (srcAccess->numSamples() != dstAccess->numSamples())
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Incompatible input/output number of samples");
-    }
-
-    numChannels = srcAccess->numChannels();
-    if (numChannels != dstAccess->numChannels())
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Incompatible input/output number of channels");
-    }
-    if (numChannels != 1 && numChannels != 3)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Input must have 1 or 3 channels");
-    }
-    if (srcAccess->numCols() != dstAccess->numCols() || srcAccess->numRows() != dstAccess->numRows())
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Input and output must have matching width and height");
-    }
-
-    isEmpty = srcAccess->numSamples() == 0 || srcAccess->numRows() == 0 || srcAccess->numCols() == 0;
-    dtype   = srcData->dtype();
-    return isPlanar;
-}
-
-inline void ValidateImagePlanes(const nvcv::Image &image, const nvcv::ImageFormat &format)
-{
-    auto data = image.exportData<nvcv::ImageDataStridedCuda>();
-    if (!data || data->numPlanes() != format.numPlanes())
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Image plane descriptors must match the image format");
-    }
-
-    constexpr int64_t limit = cuda::TypeTraits<int32_t>::max;
-    for (int p = 0; p < data->numPlanes(); ++p)
-    {
-        const nvcv::ImagePlaneStrided &plane    = data->plane(p);
-        const nvcv::Size2D             expected = format.planeSize(image.size(), p);
-        if (plane.width != expected.w || plane.height != expected.h)
-        {
-            throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                                  "Image plane descriptors must match the image format and size");
-        }
-        if (expected != image.size())
-        {
-            throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                                  "All image planes must have matching width and height");
-        }
-
-        const int64_t pixelStride = format.planePixelStrideBytes(p);
-        if (plane.rowStride < 0
-            || (static_cast<int64_t>(plane.height - 1) * plane.rowStride
-                    + static_cast<int64_t>(plane.width - 1) * pixelStride
-                > limit))
-        {
-            throw nvcv::Exception(nvcv::Status::ERROR_OVERFLOW,
-                                  "Input or output image-plane maximum byte offset exceeds %d",
-                                  static_cast<int>(limit));
-        }
-    }
-}
-
-inline bool ValidateSrcDstVarBatch(bool &isEmpty, int &numChannels, nvcv::DataType &dtype,
-                                   const nvcv::ImageBatchVarShape &src, const nvcv::ImageBatchVarShape &dst,
-                                   const nvcv::Optional<nvcv::ImageBatchVarShapeDataStridedCuda> &srcData,
-                                   const nvcv::Optional<nvcv::ImageBatchVarShapeDataStridedCuda> &dstData)
-{
-    if (!srcData)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Input must be cuda-accessible, varshape pitch-linear image batch");
-    }
-    if (!dstData)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Output must be cuda-accessible, varshape pitch-linear image batch");
-    }
-    if (srcData->numImages() != dstData->numImages())
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Incompatible input/output number of samples");
-    }
-    isEmpty = srcData->numImages() == 0;
-    if (isEmpty)
-    {
-        return false;
-    }
-
-    const auto &srcFormat = srcData->uniqueFormat();
-    const auto &dstFormat = dstData->uniqueFormat();
-    if (!srcFormat || !dstFormat)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "All images in a batch must have the same format");
-    }
-    if (srcFormat != dstFormat)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Input and output must have the same format");
-    }
-
-    numChannels = srcFormat.numChannels();
-    if (numChannels != 1 && numChannels != 3)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "The input must have 1 or 3 channels");
-    }
-    if (numChannels == 3
-        && (srcFormat.colorModel() != nvcv::ColorModel::RGB
-            || (srcFormat.swizzle() != nvcv::Swizzle::S_XYZ0 && srcFormat.swizzle() != nvcv::Swizzle::S_XYZ1)))
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT, "Three-channel input must use RGB channel order");
-    }
-
-    nvcv::ExtraChannelInfo extraChannels{};
-    srcFormat.extraChannelInfo(&extraChannels);
-    if (extraChannels.numChannels != 0)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Image formats with extra channels are not supported");
-    }
-    if (srcFormat.chromaSubsampling() != nvcv::ChromaSubsampling::CSS_444)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Chroma-subsampled image formats are not supported");
-    }
-
-    const int numPlanes = srcFormat.numPlanes();
-    dtype               = srcFormat.planeDataType(0);
-    if (numPlanes == 1)
-    {
-        if (dtype.numChannels() != numChannels || srcFormat.planePixelStrideBytes(0) != dtype.strideBytes())
-        {
-            throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                                  "Single-plane images must have one packed element per pixel");
-        }
-    }
-    else if (numPlanes != numChannels || dtype.numChannels() != 1
-             || srcFormat.planePixelStrideBytes(0) != dtype.strideBytes())
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Planar images must have one scalar, full-resolution plane per channel");
-    }
-    for (int p = 1; p < numPlanes; ++p)
-    {
-        if (srcFormat.planeDataType(p) != dtype || srcFormat.planeDataType(p).numChannels() != 1
-            || srcFormat.planePixelStrideBytes(p) != dtype.strideBytes())
-        {
-            throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                                  "All image planes must have the same packed scalar data type");
-        }
-    }
-
-    for (int i = 0; i < src.numImages(); ++i)
-    {
-        const nvcv::Size2D srcSize = src[i].size();
-        const nvcv::Size2D dstSize = dst[i].size();
-        if (srcSize != dstSize)
-        {
-            throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                                  "Input and output image %d sizes must match: input is %dx%d, output is %dx%d", i,
-                                  srcSize.w, srcSize.h, dstSize.w, dstSize.h);
-        }
-        ValidateImagePlanes(src[i], srcFormat);
-        ValidateImagePlanes(dst[i], dstFormat);
-    }
-
-    return numPlanes > 1;
-}
-
 } // anonymous namespace
 
 namespace cvcuda::priv {
@@ -530,10 +452,12 @@ void AdjustSaturation::operator()(cudaStream_t stream, const nvcv::Tensor &src, 
 
     bool           isEmpty;
     int            numChannels;
+    int            numSamples;
     nvcv::DataType dtype;
-    auto           srcData  = src.exportData<nvcv::TensorDataStridedCuda>();
-    auto           dstData  = dst.exportData<nvcv::TensorDataStridedCuda>();
-    const bool     isPlanar = ValidateSrcDstTensors(isEmpty, numChannels, dtype, srcData, dstData);
+    auto           srcData = cvcuda::priv::RequireCudaTensor(src, "Input");
+    auto           dstData = cvcuda::priv::RequireCudaTensor(dst, "Output");
+    const bool     isPlanar
+        = channel_axis::ValidateSrcDstTensors(isEmpty, numChannels, dtype, numSamples, srcData, dstData);
     if (isEmpty)
     {
         return;
@@ -557,12 +481,14 @@ void AdjustSaturation::operator()(cudaStream_t stream, const nvcv::ImageBatchVar
 {
     ValidateSaturation(saturation);
 
-    bool           isEmpty;
-    int            numChannels;
-    nvcv::DataType dtype;
-    auto           srcData  = src.exportData<nvcv::ImageBatchVarShapeDataStridedCuda>(stream);
-    auto           dstData  = dst.exportData<nvcv::ImageBatchVarShapeDataStridedCuda>(stream);
-    const bool     isPlanar = ValidateSrcDstVarBatch(isEmpty, numChannels, dtype, src, dst, srcData, dstData);
+    bool                        isEmpty;
+    int                         numChannels;
+    nvcv::DataType              dtype;
+    elem_stream::GroupBatchInfo groupInfo;
+    auto                        srcData = cvcuda::priv::RequireCudaVarShape(src, stream, "Input");
+    auto                        dstData = cvcuda::priv::RequireCudaVarShape(dst, stream, "Output");
+    const bool                  isPlanar
+        = channel_axis::ValidateSrcDstVarBatch(isEmpty, numChannels, dtype, src, dst, srcData, dstData, &groupInfo);
     if (isEmpty)
     {
         return;
@@ -576,7 +502,7 @@ void AdjustSaturation::operator()(cudaStream_t stream, const nvcv::ImageBatchVar
                      {
                          using T                   = decltype(dummy);
                          constexpr int numChannels = decltype(channelsIC)::value;
-                         RunVarShape<T, numChannels>(stream, *srcData, *dstData, isPlanar, ratio, oneMinus);
+                         RunVarShape<T, numChannels>(stream, *srcData, *dstData, isPlanar, groupInfo, ratio, oneMinus);
                      });
 }
 

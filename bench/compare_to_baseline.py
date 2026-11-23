@@ -34,10 +34,10 @@ from _internal.baselines import (
     ConfigRef,
     baseline_updates_from_jsons,
     load_config_index,
+    load_sku_policies,
     parse_case_key,
-    validate_baselines_in_document,
     validate_case_key_for_config,
-    sku_stems,
+    validate_baselines_in_document,
 )
 
 
@@ -300,6 +300,7 @@ def format_markdown(
     baseline_label: Path | str,
     current_path: Path,
     thresholds: Thresholds,
+    max_rows_per_section: Optional[int] = None,
 ) -> str:
     lines: List[str] = []
     lines.append(f"# Performance regression report -- {sku}")
@@ -321,23 +322,25 @@ def format_markdown(
     lines.extend(_summary_stats_lines(result))
     lines.append("")
 
-    def _row_section(title: str, rows: List[RowResult]) -> None:
+    def _section(title: str, rows: Sequence, fmt) -> None:
         lines.append(f"## {title} ({len(rows)})")
         if not rows:
             lines.append("_none_")
         else:
-            for row in rows:
-                lines.append(f"- {_fmt_row(row)}")
+            shown = (
+                rows if max_rows_per_section is None else rows[:max_rows_per_section]
+            )
+            for row in shown:
+                lines.append(f"- {fmt(row)}")
+            if len(shown) < len(rows):
+                lines.append(f"- ...and {len(rows) - len(shown)} more")
         lines.append("")
 
+    def _row_section(title: str, rows: List[RowResult]) -> None:
+        _section(title, rows, _fmt_row)
+
     def _missing_section(title: str, rows: List[MissingRow]) -> None:
-        lines.append(f"## {title} ({len(rows)})")
-        if not rows:
-            lines.append("_none_")
-        else:
-            for row in rows:
-                lines.append(f"- {_fmt_missing(row)}")
-        lines.append("")
+        _section(title, rows, _fmt_missing)
 
     _row_section("Regressions", result.regressions)
     _row_section("Unexpected improvements", result.improvements)
@@ -416,10 +419,13 @@ def format_junit(result: CompareResult, sku: str) -> bytes:
 
 
 def _validate_json_baselines(index: ConfigIndex, sku_map_path: Path) -> None:
-    stems = sku_stems(sku_map_path, strict=True)
+    policies = load_sku_policies(sku_map_path, strict=True)
+    stems = set(policies)
     errors: List[str] = []
     for doc in index.docs_by_path.values():
-        errors.extend(validate_baselines_in_document(doc, index, stems))
+        errors.extend(
+            validate_baselines_in_document(doc, index, stems, sku_policies=policies)
+        )
     if errors:
         raise BaselineError("invalid JSON baseline entries:\n  " + "\n  ".join(errors))
 
@@ -534,7 +540,9 @@ Exit status:
         metavar="MD",
         type=Path,
         default=None,
-        help="Write the Markdown report to MD instead of printing it.",
+        help=(
+            "Also write the Markdown report to MD. The report is printed either way, in full."
+        ),
     )
     return p.parse_args(argv)
 
@@ -584,8 +592,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     report = format_markdown(result, sku, operators_dir, args.current, thresholds)
     if args.markdown:
         args.markdown.write_text(report)
+
+    # CI archives --markdown rather than showing it, so the printed copy is the only on-screen
+    # evidence of which rows moved. Print it in full.
+    print()
+    if args.markdown:
+        print(format_markdown(result, sku, operators_dir, args.current, thresholds))
+        print(f"Full report written to {args.markdown}")
     else:
-        print()
         print(report)
 
     if args.junit:

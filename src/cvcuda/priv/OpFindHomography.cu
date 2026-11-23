@@ -18,6 +18,7 @@
 #include "Nvtx.hpp"
 #include "OpFindHomography.hpp"
 #include "SafeSize.hpp"
+#include "TensorAccessValidation.hpp"
 
 #include <cuda_runtime.h>
 #include <cvcuda/cuda_tools/DropCast.hpp>
@@ -1400,6 +1401,9 @@ void FindHomographyWrapper(SrcDstWrapper srcWrap, SrcDstWrapper dstWrap, ModelTy
     grid.z = batchSize;
     LtLOp ltl_op(srcMean, dstMean, srcShiftSum, dstShiftSum);
     compute_LtL<<<grid, block, 0, stream>>>(srcWrap, dstWrap, LtL, ltl_op, numPoints, batchSize);
+    // One check covers the three launches above (cudaGetLastError() is sticky until read). It must
+    // run before the cuSOLVER calls below, which may consume the thread's CUDA error state.
+    NVCV_CHECK_THROW(cudaGetLastError());
 #ifdef DEBUG
     for (int b = 0; b < batchSize; b++)
     {
@@ -1464,6 +1468,7 @@ void FindHomographyWrapper(SrcDstWrapper srcWrap, SrcDstWrapper dstWrap, ModelTy
     grid.z = 1;
     computeModel<<<grid, block, 0, stream>>>(srcWrap, dstWrap, srcMean, dstMean, srcShiftSum, dstShiftSum, LtL, W, r, J,
                                              calc_buffer, modelWrap, numPoints, batchSize);
+    NVCV_CHECK_THROW(cudaGetLastError());
 }
 
 inline void RunFindHomography(const nvcv::TensorDataStridedCuda &src, const nvcv::TensorDataStridedCuda &dst,
@@ -1660,26 +1665,9 @@ void FindHomography::operator()(cudaStream_t stream, const nvcv::Tensor &srcPoin
                                 const nvcv::Tensor &models) const
 {
     CVCUDA_NVTX_RANGE("cvcuda::FindHomography::operator()[Tensor]");
-    auto srcData = srcPoints.exportData<nvcv::TensorDataStridedCuda>();
-    if (!srcData)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Input must be cuda-accessible, pitch-linear tensor");
-    }
-
-    auto dstData = dstPoints.exportData<nvcv::TensorDataStridedCuda>();
-    if (!dstData)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Output must be cuda-accessible, pitch-linear tensor");
-    }
-
-    auto modelData = models.exportData<nvcv::TensorDataStridedCuda>();
-    if (!modelData)
-    {
-        throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                              "Input must be cuda-accessible, pitch-linear tensor");
-    }
+    auto srcData   = RequireCudaTensor(srcPoints, "Input");
+    auto dstData   = RequireCudaTensor(dstPoints, "Output");
+    auto modelData = RequireCudaTensor(models, "Input");
 
     auto &state = m_state.get();
     RunFindHomography(*srcData, *dstData, *modelData, &state.bufferOffset, &state.cusolverData, stream);
@@ -1698,26 +1686,9 @@ void FindHomography::operator()(cudaStream_t stream, const nvcv::TensorBatch &sr
     auto &state = m_state.get();
     for (int b = 0; b < srcPoints.numTensors(); b++)
     {
-        auto srcData = srcPoints[b].exportData<nvcv::TensorDataStridedCuda>();
-        if (!srcData)
-        {
-            throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                                  "Input src points must be cuda-accessible, pitch-linear tensor");
-        }
-
-        auto dstData = dstPoints[b].exportData<nvcv::TensorDataStridedCuda>();
-        if (!dstData)
-        {
-            throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                                  "Input dst points must be cuda-accessible, pitch-linear tensor");
-        }
-
-        auto modelData = models[b].exportData<nvcv::TensorDataStridedCuda>();
-        if (!modelData)
-        {
-            throw nvcv::Exception(nvcv::Status::ERROR_INVALID_ARGUMENT,
-                                  "model must be cuda-accessible, pitch-linear tensor");
-        }
+        auto srcData   = RequireCudaTensor(srcPoints[b], "Input src points");
+        auto dstData   = RequireCudaTensor(dstPoints[b], "Input dst points");
+        auto modelData = RequireCudaTensor(models[b], "model");
 
         RunFindHomography(*srcData, *dstData, *modelData, &state.bufferOffset, &state.cusolverData, stream);
     }

@@ -69,7 +69,7 @@ CVCUDA_PUBLIC NVCVStatus cvcudaLaplacianCreate(NVCVOperatorHandle *handle);
  *      16bit Signed   | No
  *      32bit Unsigned | No
  *      32bit Signed   | No
- *      16bit Float    | No
+ *      16bit Float    | Yes
  *      32bit Float    | Yes
  *      64bit Float    | No
  *
@@ -86,7 +86,7 @@ CVCUDA_PUBLIC NVCVStatus cvcudaLaplacianCreate(NVCVOperatorHandle *handle);
  *      16bit Signed   | No
  *      32bit Unsigned | No
  *      32bit Signed   | No
- *      16bit Float    | No
+ *      16bit Float    | Yes
  *      32bit Float    | Yes
  *      64bit Float    | No
  *
@@ -125,6 +125,9 @@ CVCUDA_PUBLIC NVCVStatus cvcudaLaplacianSubmit(NVCVOperatorHandle handle, cudaSt
 
 /**
  * Executes the Laplacian operation on a batch of images.
+ *
+ * Input and output batches must contain the same number of images. Each output image must have
+ * the same width and height as its corresponding input image.
  *
  * @param[in] in Input image batch.
  * @param[out] out Output image batch.

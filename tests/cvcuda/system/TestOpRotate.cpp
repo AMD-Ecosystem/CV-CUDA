@@ -16,6 +16,7 @@
  */
 
 #include "Definitions.hpp"
+#include "HalfTestUtils.hpp"
 #include "PlanarParityUtils.hpp"
 
 #include <common/ValueTests.hpp>
@@ -157,8 +158,8 @@ static void StoreNearestPixel(T *dstPtr, int dstBase, const T *srcPtr, int srcRo
 
 template<typename T>
 static void Rotate(std::vector<T> &hDst, int dstRowStride, nvcv::Size2D dstSize, const std::vector<T> &hSrc,
-                   int srcRowStride, nvcv::Size2D, nvcv::ImageFormat fmt, const double angleDeg, const double2 shift,
-                   NVCVInterpolationType interpolation)
+                   int srcRowStride, nvcv::Size2D srcSize, nvcv::ImageFormat fmt, const double angleDeg,
+                   const double2 shift, NVCVInterpolationType interpolation)
 {
     assert(fmt.numPlanes() == 1);
 
@@ -171,8 +172,8 @@ static void Rotate(std::vector<T> &hDst, int dstRowStride, nvcv::Size2D dstSize,
     std::array<double, 6> d_aCoeffs;
     compute_warpAffine(angleDeg, shift.x, shift.y, d_aCoeffs.data());
 
-    int width  = dstSize.w;
-    int height = dstSize.h;
+    int width  = srcSize.w;
+    int height = srcSize.h;
 
     for (int dst_y = 0; dst_y < dstSize.h; dst_y++)
     {
@@ -215,6 +216,9 @@ NVCV_TEST_SUITE_P(OpRotate, test::ValueList<int, int, int, int, NVCVInterpolatio
     {         4,         4,        4,         4,    NVCV_INTERP_NEAREST,           4,     45},
     {         5,         5,        5,         5,    NVCV_INTERP_LINEAR,            1,     45},
     {         5,         5,        5,         5,    NVCV_INTERP_LINEAR,            4,     45},
+
+    {        97,        97,       65,        33,    NVCV_INTERP_LINEAR,            1,     90},
+    {       129,       129,       97,        65,    NVCV_INTERP_LINEAR,            1,     90},
 
     {         4,         4,        4,         4,    NVCV_INTERP_CUBIC,             1,     90},
     {         4,         4,        4,         4,    NVCV_INTERP_CUBIC,             4,     90},
@@ -625,10 +629,13 @@ NVCV_TEST_SUITE_P(OpRotatePlanar,
     {176, 113, NVCV_INTERP_NEAREST,  90, 2,    nvcv::FMT_RGB8p,    nvcv::FMT_RGB8}, // RGB8, nearest
     {123,  66,  NVCV_INTERP_LINEAR,  45, 2,    nvcv::FMT_RGB8p,    nvcv::FMT_RGB8}, // RGB8, linear, fractional
     { 64,  48,   NVCV_INTERP_CUBIC,  30, 1,    nvcv::FMT_RGB8p,    nvcv::FMT_RGB8}, // RGB8, cubic, fractional
+    {  1,   1,   NVCV_INTERP_CUBIC,   0, 1,    nvcv::FMT_RGB8p,    nvcv::FMT_RGB8}, // partial launch tiles
     { 50,  40, NVCV_INTERP_NEAREST,  90, 2,   nvcv::FMT_RGBA8p,   nvcv::FMT_RGBA8}, // RGBA8, nearest
     {100,  80,  NVCV_INTERP_LINEAR,  60, 1,   nvcv::FMT_RGBA8p,   nvcv::FMT_RGBA8}, // RGBA8, linear, fractional
     { 64,  48,   NVCV_INTERP_CUBIC,  45, 2, nvcv::FMT_RGBAf32p, nvcv::FMT_RGBAf32}, // float, cubic, fractional
     { 72,  56,  NVCV_INTERP_LINEAR, 120, 1, nvcv::FMT_RGBAf32p, nvcv::FMT_RGBAf32}, // float, linear
+    { 62,  47,  NVCV_INTERP_LINEAR,  45, 2,  nvcv::FMT_RGBf16p,  nvcv::FMT_RGBf16}, // f16, linear, fractional
+    { 56,  42,   NVCV_INTERP_CUBIC,  30, 1, nvcv::FMT_RGBAf16p, nvcv::FMT_RGBAf16}, // f16, cubic, fractional
 });
 
 // clang-format on
@@ -645,11 +652,263 @@ TEST_P(OpRotatePlanar, varshape_matches_interleaved)
                                 GetParamValue<2>(), GetParamValue<3>(), GetParamValue<4>());
 }
 
+// =============================================================================
+// F16 correctness
+//
+// The main OpRotate suite has no format axis (it is fixed to RGB8), so F16 gets a dedicated suite.
+// Inputs are half-quantized so kernel and reference consume identical values; the gold is the
+// in-file FP32 reference run on the widened input, per the F16 tolerance policy in
+// HalfTestUtils.hpp. The in-file gold models CUBIC as an exact gather, which only holds for
+// 90/180-degree angles, so the CUBIC rows stick to those (like the RGB8 rows above).
+// =============================================================================
+
+// Parameters: width, height, interpolation, angle (deg), numImages, format
+// clang-format off
+NVCV_TEST_SUITE_P(OpRotateF16, test::ValueList<int, int, NVCVInterpolationType, double, int, nvcv::ImageFormat>{
+    {24, 18, NVCV_INTERP_NEAREST,  90, 2,  nvcv::FMT_RGBf16}, // C3, pure gather
+    {25, 17,  NVCV_INTERP_LINEAR,  45, 2,  nvcv::FMT_RGBf16}, // C3, fractional coordinates
+    {24, 18,  NVCV_INTERP_LINEAR,  45, 1,     nvcv::FMT_F16}, // C1 scalar kernel
+    {26, 20,   NVCV_INTERP_CUBIC, 180, 2, nvcv::FMT_RGBAf16}, // C4, cubic (gather-exact angle)
+});
+
+// clang-format on
+
+TEST_P(OpRotateF16, tensor_matches_fp32_gold)
+{
+    const int                   width          = GetParamValue<0>();
+    const int                   height         = GetParamValue<1>();
+    const NVCVInterpolationType interpolation  = GetParamValue<2>();
+    const double                angleDeg       = GetParamValue<3>();
+    const int                   numberOfImages = GetParamValue<4>();
+    const nvcv::ImageFormat     fmt            = GetParamValue<5>();
+
+    const int rowElems = width * fmt.numChannels();
+    const int rowBytes = width * fmt.planePixelStrideBytes(0);
+
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+
+    nvcv::Tensor imgSrc(numberOfImages, {width, height}, fmt);
+    nvcv::Tensor imgDst(numberOfImages, {width, height}, fmt);
+
+    auto srcData = imgSrc.exportData<nvcv::TensorDataStridedCuda>();
+    ASSERT_NE(nullptr, srcData);
+    auto srcAccess = nvcv::TensorDataAccessStridedImagePlanar::Create(*srcData);
+    ASSERT_TRUE(srcAccess);
+
+    std::vector<std::vector<float>> srcFloat(numberOfImages);
+    for (int i = 0; i < numberOfImages; ++i)
+    {
+        srcFloat[i] = test::MakeHalfQuantizedPattern(height * rowElems, i, -3.5f, 0.25f,
+                                                     97); // fractional quarter steps over [-3.5, 20.5]
+
+        std::vector<uint8_t> srcHalf = test::FloatToHalfBytes(srcFloat[i]);
+        ASSERT_EQ(cudaSuccess, cudaMemcpy2D(srcAccess->sampleData(i), srcAccess->rowStride(), srcHalf.data(), rowBytes,
+                                            rowBytes, height, cudaMemcpyHostToDevice));
+    }
+
+    // Rotate leaves destination pixels whose source maps out of bounds unwritten (e.g. the corners
+    // at 45 degrees); zero the device output to match the zero-initialized gold.
+    ZeroTensor(imgDst, stream);
+
+    double shiftX = 0;
+    double shiftY = 0;
+    compute_center_shift((width - 1) / 2, (height - 1) / 2, angleDeg, shiftX, shiftY);
+    const double2 shift = {shiftX, shiftY};
+
+    cvcuda::Rotate rotateOp(0);
+    EXPECT_NO_THROW(rotateOp(stream, imgSrc, imgDst, angleDeg, shift, interpolation));
+
+    EXPECT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+    EXPECT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+
+    auto dstData = imgDst.exportData<nvcv::TensorDataStridedCuda>();
+    ASSERT_NE(nullptr, dstData);
+    auto dstAccess = nvcv::TensorDataAccessStridedImagePlanar::Create(*dstData);
+    ASSERT_TRUE(dstAccess);
+
+    for (int i = 0; i < numberOfImages; ++i)
+    {
+        SCOPED_TRACE(i);
+
+        std::vector<uint8_t> testHalf(height * rowBytes);
+        ASSERT_EQ(cudaSuccess, cudaMemcpy2D(testHalf.data(), rowBytes, dstAccess->sampleData(i), dstAccess->rowStride(),
+                                            rowBytes, height, cudaMemcpyDeviceToHost));
+
+        std::vector<float> goldFloat(height * rowElems, 0.f);
+        Rotate<float>(goldFloat, rowElems, {width, height}, srcFloat[i], rowElems, {width, height}, fmt, angleDeg,
+                      shift, interpolation);
+
+        test::ExpectF16InterpOutput(goldFloat, testHalf, interpolation);
+    }
+}
+
+TEST_P(OpRotateF16, varshape_matches_fp32_gold)
+{
+    const int                   widthBase      = GetParamValue<0>();
+    const int                   heightBase     = GetParamValue<1>();
+    const NVCVInterpolationType interpolation  = GetParamValue<2>();
+    const double                angleDeg       = GetParamValue<3>();
+    const int                   numberOfImages = GetParamValue<4>();
+    const nvcv::ImageFormat     fmt            = GetParamValue<5>();
+
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+
+    // Deterministically vary the per-image size so the var-shape path is exercised for real; the
+    // shared angle still gets per-image affine coefficients from the per-image center shift.
+    std::vector<nvcv::Image>        imgSrc;
+    std::vector<nvcv::Image>        imgDst;
+    std::vector<std::vector<float>> srcFloat(numberOfImages);
+    std::vector<double2>            shiftVecs;
+
+    nvcv::Tensor angleDegTensor(nvcv::TensorShape({numberOfImages}, "N"), nvcv::TYPE_F64);
+    nvcv::Tensor shiftTensor(nvcv::TensorShape({numberOfImages, 2}, nvcv::TENSOR_NW), nvcv::TYPE_F64);
+
+    for (int i = 0; i < numberOfImages; ++i)
+    {
+        const int width  = widthBase + 3 * i;
+        const int height = heightBase + 2 * i;
+
+        imgSrc.emplace_back(nvcv::Size2D{width, height}, fmt);
+        imgDst.emplace_back(nvcv::Size2D{width, height}, fmt);
+
+        double2 shift = {0, 0};
+        compute_center_shift((width - 1) / 2, (height - 1) / 2, angleDeg, shift.x, shift.y);
+        shiftVecs.push_back(shift);
+
+        const int rowElems = width * fmt.numChannels();
+        const int rowBytes = width * fmt.planePixelStrideBytes(0);
+
+        srcFloat[i] = test::MakeHalfQuantizedPattern(height * rowElems, i, -3.5f, 0.25f,
+                                                     97); // fractional quarter steps over [-3.5, 20.5]
+
+        std::vector<uint8_t> srcHalf = test::FloatToHalfBytes(srcFloat[i]);
+
+        const auto data = imgSrc[i].exportData<nvcv::ImageDataStridedCuda>();
+        ASSERT_NE(data, nvcv::NullOpt);
+        ASSERT_EQ(cudaSuccess, cudaMemcpy2D(data->plane(0).basePtr, data->plane(0).rowStride, srcHalf.data(), rowBytes,
+                                            rowBytes, height, cudaMemcpyHostToDevice));
+    }
+
+    {
+        std::vector<double> angles(numberOfImages, angleDeg);
+
+        auto angleData = angleDegTensor.exportData<nvcv::TensorDataStridedCuda>();
+        auto shiftData = shiftTensor.exportData<nvcv::TensorDataStridedCuda>();
+        ASSERT_NE(angleData, nvcv::NullOpt);
+        ASSERT_NE(shiftData, nvcv::NullOpt);
+        auto shiftAcc = nvcv::TensorDataAccessStrided::Create(*shiftData);
+        ASSERT_TRUE(shiftAcc);
+
+        ASSERT_EQ(cudaSuccess, cudaMemcpy(angleData->basePtr(), angles.data(), angles.size() * sizeof(double),
+                                          cudaMemcpyHostToDevice));
+        ASSERT_EQ(cudaSuccess, cudaMemcpy2D(shiftAcc->sampleData(0), shiftAcc->sampleStride(), shiftVecs.data(),
+                                            sizeof(double2), sizeof(double2), numberOfImages, cudaMemcpyHostToDevice));
+    }
+
+    nvcv::ImageBatchVarShape batchSrc(numberOfImages);
+    batchSrc.pushBack(imgSrc.begin(), imgSrc.end());
+
+    nvcv::ImageBatchVarShape batchDst(numberOfImages);
+    batchDst.pushBack(imgDst.begin(), imgDst.end());
+
+    // Same rationale as the tensor test: uncovered destination pixels stay unwritten.
+    ZeroVarShapeBatch(batchDst, stream);
+
+    cvcuda::Rotate rotateOp(numberOfImages);
+    EXPECT_NO_THROW(rotateOp(stream, batchSrc, batchDst, angleDegTensor, shiftTensor, interpolation));
+
+    EXPECT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+    EXPECT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+
+    for (int i = 0; i < numberOfImages; ++i)
+    {
+        SCOPED_TRACE(i);
+
+        const auto data = imgDst[i].exportData<nvcv::ImageDataStridedCuda>();
+        ASSERT_NE(data, nvcv::NullOpt);
+
+        const int width    = data->plane(0).width;
+        const int height   = data->plane(0).height;
+        const int rowElems = width * fmt.numChannels();
+        const int rowBytes = width * fmt.planePixelStrideBytes(0);
+
+        std::vector<uint8_t> testHalf(height * rowBytes);
+        ASSERT_EQ(cudaSuccess, cudaMemcpy2D(testHalf.data(), rowBytes, data->plane(0).basePtr, data->plane(0).rowStride,
+                                            rowBytes, height, cudaMemcpyDeviceToHost));
+
+        std::vector<float> goldFloat(height * rowElems, 0.f);
+        Rotate<float>(goldFloat, rowElems, {width, height}, srcFloat[i], rowElems, {width, height}, fmt, angleDeg,
+                      shiftVecs[i], interpolation);
+
+        test::ExpectF16InterpOutput(goldFloat, testHalf, interpolation);
+    }
+}
+
+TEST(OpRotatePlanar, single_channel_cubic_tensor_matches_interleaved)
+{
+    constexpr int    width    = 57;
+    constexpr int    height   = 43;
+    constexpr double angleDeg = 37;
+    double           shiftX   = 0;
+    double           shiftY   = 0;
+    compute_center_shift((width - 1) / 2, (height - 1) / 2, angleDeg, shiftX, shiftY);
+    const double2 shift = {shiftX, shiftY};
+
+    test::planar::RunTensorSingleChannelLayoutParity(
+        width, height, width, height, 2, nvcv::TYPE_U8,
+        [shift](cudaStream_t stream, const nvcv::Tensor &src, const nvcv::Tensor &dst)
+        {
+            ZeroTensor(dst, stream);
+            cvcuda::Rotate op(0);
+            EXPECT_NO_THROW(op(stream, src, dst, angleDeg, shift, NVCV_INTERP_CUBIC));
+        });
+}
+
+TEST(OpRotatePlanar, single_channel_int16_tensor_matches_interleaved)
+{
+    constexpr int    width    = 49;
+    constexpr int    height   = 37;
+    constexpr double angleDeg = 37;
+    double           shiftX   = 0;
+    double           shiftY   = 0;
+    compute_center_shift((width - 1) / 2, (height - 1) / 2, angleDeg, shiftX, shiftY);
+    const double2 shift = {shiftX, shiftY};
+
+    for (const auto dtype : {nvcv::TYPE_U16, nvcv::TYPE_S16})
+    {
+        test::planar::RunTensorSingleChannelLayoutParity(
+            width, height, width, height, 2, dtype,
+            [shift](cudaStream_t stream, const nvcv::Tensor &src, const nvcv::Tensor &dst)
+            {
+                ZeroTensor(dst, stream);
+                cvcuda::Rotate op(0);
+                EXPECT_NO_THROW(op(stream, src, dst, angleDeg, shift, NVCV_INTERP_LINEAR));
+            });
+    }
+}
+
+TEST(OpRotatePlanar, varshape_single_image_compute_affine)
+{
+    RunPlanarParityVarShapeCase(nvcv::FMT_RGB8p, nvcv::FMT_RGB8, 9, 7, NVCV_INTERP_NEAREST, 90, 1);
+}
+
+TEST(OpRotatePlanar, varshape_multi_image_compute_affine)
+{
+    RunPlanarParityVarShapeCase(nvcv::FMT_RGB8p, nvcv::FMT_RGB8, 33, 17, NVCV_INTERP_LINEAR, 30, 3);
+}
+
+TEST(OpRotatePlanar, varshape_rgbf32_compute_affine_body)
+{
+    RunPlanarParityVarShapeCase(nvcv::FMT_RGBf32p, nvcv::FMT_RGBf32, 19, 15, NVCV_INTERP_LINEAR, 37, 2);
+}
+
 // clang-format off
 NVCV_TEST_SUITE_P(OpRotate_Negative, test::ValueList<nvcv::ImageFormat, nvcv::ImageFormat, NVCVInterpolationType>{
     {nvcv::FMT_RGB8, nvcv::FMT_RGB8, NVCV_INTERP_LANCZOS},
     {nvcv::FMT_RGB8, nvcv::FMT_RGB8p, NVCV_INTERP_NEAREST}, // data format is different (interleaved in, planar out)
-    {nvcv::FMT_RGBf16, nvcv::FMT_RGBf16, NVCV_INTERP_NEAREST},
+    {nvcv::FMT_F64, nvcv::FMT_F64, NVCV_INTERP_NEAREST}, // unsupported data type (64-bit float)
 });
 
 NVCV_TEST_SUITE_P(OpRotateVarshape_Negative, test::ValueList<nvcv::ImageFormat, nvcv::ImageFormat, int, int, NVCVInterpolationType, nvcv::DataType, nvcv::DataType>{
@@ -657,7 +916,7 @@ NVCV_TEST_SUITE_P(OpRotateVarshape_Negative, test::ValueList<nvcv::ImageFormat, 
     {nvcv::FMT_RGB8, nvcv::FMT_RGB8, 6, 5, NVCV_INTERP_NEAREST, nvcv::TYPE_F64, nvcv::TYPE_F64},
     {nvcv::FMT_RGB8, nvcv::FMT_RGB8, 2, -1, NVCV_INTERP_NEAREST, nvcv::TYPE_F64, nvcv::TYPE_F64},
     {nvcv::FMT_RGB8, nvcv::FMT_RGB8p, 2, 5, NVCV_INTERP_NEAREST, nvcv::TYPE_F64, nvcv::TYPE_F64}, // mismatched layout
-    {nvcv::FMT_RGBf16, nvcv::FMT_RGBf16, 2, 5, NVCV_INTERP_NEAREST, nvcv::TYPE_F64, nvcv::TYPE_F64},
+    {nvcv::FMT_F64, nvcv::FMT_F64, 2, 5, NVCV_INTERP_NEAREST, nvcv::TYPE_F64, nvcv::TYPE_F64}, // unsupported data type (64-bit float)
     {nvcv::FMT_RGB8, nvcv::FMT_RGB8, 2, 5, NVCV_INTERP_NEAREST, nvcv::TYPE_F32, nvcv::TYPE_F64},
     {nvcv::FMT_RGB8, nvcv::FMT_RGB8, 2, 5, NVCV_INTERP_NEAREST, nvcv::TYPE_F64, nvcv::TYPE_F32},
 });
@@ -805,4 +1064,66 @@ TEST(OpRotate_Negative, varshape_hasDifferentFormat)
 TEST(OpRotate_Negative, create_null_handle)
 {
     EXPECT_EQ(cvcudaRotateCreate(nullptr, 2), NVCV_ERROR_INVALID_ARGUMENT);
+}
+
+TEST(OpRotate_Negative, two_channel_tensor_rejected)
+{
+    cudaStream_t stream;
+    EXPECT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+
+    nvcv::Tensor imgSrc(2, {4, 4}, nvcv::FMT_2F32);
+    nvcv::Tensor imgDst(2, {4, 4}, nvcv::FMT_2F32);
+
+    cvcuda::Rotate        rotateOp(0);
+    double                angleDeg      = 90;
+    double2               shift         = {-1, -1};
+    NVCVInterpolationType interpolation = NVCV_INTERP_NEAREST;
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT,
+              nvcv::ProtectCall([&rotateOp, &stream, &imgSrc, &imgDst, &angleDeg, &shift, &interpolation]
+                                { rotateOp(stream, imgSrc, imgDst, angleDeg, shift, interpolation); }));
+
+    EXPECT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+    EXPECT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+TEST(OpRotate_Negative, varshape_rejects_non_positive_max_batch_size)
+{
+    cudaStream_t stream;
+    EXPECT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+
+    constexpr int numberOfImages = 1;
+
+    std::vector<nvcv::Image> imgSrc;
+    std::vector<nvcv::Image> imgDst;
+    imgSrc.emplace_back(nvcv::Size2D{4, 4}, nvcv::FMT_RGB8);
+    imgDst.emplace_back(nvcv::Size2D{4, 4}, nvcv::FMT_RGB8);
+
+    nvcv::ImageBatchVarShape batchSrc(numberOfImages);
+    batchSrc.pushBack(imgSrc.begin(), imgSrc.end());
+
+    nvcv::ImageBatchVarShape batchDst(numberOfImages);
+    batchDst.pushBack(imgDst.begin(), imgDst.end());
+
+    nvcv::Tensor angleDegTensor(nvcv::TensorShape({numberOfImages}, "N"), nvcv::TYPE_F64);
+    nvcv::Tensor shiftTensor(nvcv::TensorShape({numberOfImages, 2}, nvcv::TENSOR_NW), nvcv::TYPE_F64);
+
+    cvcuda::Rotate                  rotateOp(0);
+    constexpr NVCVInterpolationType interpolation = NVCV_INTERP_NEAREST;
+    EXPECT_EQ(
+        NVCV_ERROR_INVALID_ARGUMENT,
+        nvcv::ProtectCall([&] { rotateOp(stream, batchSrc, batchDst, angleDegTensor, shiftTensor, interpolation); }));
+
+    EXPECT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+    EXPECT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+TEST(OpRotatePlanar, varshape_rgba_u16_cubic_matches_interleaved)
+{
+    const nvcv::ImageFormat rgbaU16{nvcv::ColorModel::RGB,    nvcv::CSPEC_UNDEFINED, nvcv::MemLayout::PITCH_LINEAR,
+                                    nvcv::DataKind::UNSIGNED, nvcv::Swizzle::S_XYZW, nvcv::Packing::X16_Y16_Z16_W16};
+    const nvcv::ImageFormat rgbaU16p{nvcv::ColorModel::RGB,    nvcv::CSPEC_UNDEFINED, nvcv::MemLayout::PITCH_LINEAR,
+                                     nvcv::DataKind::UNSIGNED, nvcv::Swizzle::S_XYZW, nvcv::Packing::X16,
+                                     nvcv::Packing::X16,       nvcv::Packing::X16,    nvcv::Packing::X16};
+
+    RunPlanarParityVarShapeCase(rgbaU16p, rgbaU16, 67, 43, NVCV_INTERP_CUBIC, 90, 2);
 }

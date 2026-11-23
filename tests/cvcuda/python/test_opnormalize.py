@@ -410,7 +410,9 @@ globals().update(
             cvcuda.Type.U16,
             cvcuda.Type.S16,
             cvcuda.Type.S32,
+            cvcuda.Type.F16,
             cvcuda.Type.F32,
+            cvcuda.Type.F64,
         },
         supported_layouts={"NHWC", "HWC", "NCHW", "CHW"},
         supported_channels={1, 3, 4},
@@ -425,8 +427,11 @@ globals().update(
             ("image_batch", cvcuda.normalize, _normalize_varshape_params),
         ],
         keystone_dlc=(cvcuda.Type.U8, "NHWC", 3),
+        # The var-shape output dtype must be U8, F16, F32, or F64; these tests use output == input
+        # with the keystone channel count, and there is no multi-channel F64 image format.
         supported_dtypes={
             cvcuda.Type.U8,
+            cvcuda.Type.F16,
             cvcuda.Type.F32,
         },
         supported_layouts={"NHWC"},
@@ -451,7 +456,9 @@ globals().update(
             cvcuda.Type.U16,
             cvcuda.Type.S16,
             cvcuda.Type.S32,
+            cvcuda.Type.F16,
             cvcuda.Type.F32,
+            cvcuda.Type.F64,
         },
         supported_layouts={"NHWC", "HWC", "NCHW", "CHW"},
         supported_channels={1, 3, 4},

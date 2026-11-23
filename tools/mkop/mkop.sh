@@ -14,8 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# POSIX character-class names for `tr` case conversion (shared to avoid
-# duplicating the literals; SonarQube shelldre:S1192).
+# POSIX character-class names for `tr` case conversion, shared to avoid
+# duplicating the literals.
 readonly TR_LOWER='[:lower:]'
 readonly TR_UPPER='[:upper:]'
 
@@ -120,7 +120,7 @@ add_to_python_operators() {
     if ! grep -q "$name" "$file"; then
         line_number=$(grep -n 'void ExportOp' "$file" | tail -1 | cut -d ':' -f 1)
         line_number=$((line_number+1))
-        sed -i "$line_number i\void ExportOp$name(py::module &m);" "$file"
+        sed -i "$line_number i\void ExportOp$name(py::module_ &m);" "$file"
 
     fi
     return $?

@@ -3,11 +3,15 @@
 
 # Include README and license files in source distributions
 include README.md
+include LICENSE.md
 include pyproject.toml
 
 # Include all .so files (binary extensions)
 recursive-include cvcuda *.so
 recursive-include cvcuda_cu*.libs *
+
+# Include pure-Python sources (e.g. the cvcuda.tv subpackage) for sdist completeness
+recursive-include cvcuda *.py
 
 # Include type stubs and PEP 561 marker
 recursive-include cvcuda *.pyi

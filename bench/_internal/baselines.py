@@ -26,7 +26,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from itertools import product
 from pathlib import Path
 from typing import (
@@ -45,13 +45,22 @@ from typing import (
 if TYPE_CHECKING:
     import pandas as pd
 
-from .quality import BenchmarkQualityCriteria, DEFAULT_BENCHMARK_QUALITY
+from .quality import (
+    BASELINE_REFRESH_INCOMPLETE_FIELD,
+    BenchmarkQualityCriteria,
+    DEFAULT_BENCHMARK_QUALITY,
+)
 
 BENCH_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_DIR = BENCH_DIR / "config"
 DEFAULT_OPERATORS_DIR = DEFAULT_CONFIG_DIR / "operators"
 DEFAULT_SKU_MAP_PATH = DEFAULT_CONFIG_DIR / "sku_map.json"
 DEFAULT_MAX_BASELINE_REGRESSION_PCT = 10.0
+# Measurements from a GPU that is not a baseline target. Drift can chart the
+# stem. Committed baseline files still reject it: it is not in sku_map.json.
+UNMAPPED_SKU_PREFIX = "unmapped_"
+SUPPORTED_CUDA_MAJORS = (12, 13)
+SkuKey = Tuple[str, Optional[int], int, int]
 
 CONFIG_KEY_COLUMN = "config_key"
 DEVICE_NAME_COLUMN = "Device Name"
@@ -60,6 +69,9 @@ LOCKED_CLOCK_COLUMN = "Locked SM Clock (MHz)"
 VBIOS_COLUMN = "vBIOS Version"
 
 LANGUAGES = frozenset({"cpp", "python"})
+# Mirrors config.load_config.VALID_TIERS. Declared here too so a SKU policy can
+# restrict which tiers it owes baselines for without importing the config loader.
+TIERS = frozenset({"basic", "advanced"})
 
 GPU_TIME_COLUMN = "GPU Time (µs)"
 GPU_NOISE_US_COLUMN = "GPU Noise (µs)"
@@ -124,6 +136,16 @@ BASELINE_METRIC_FIELDS = (
 )
 GPU_GAP_STDDEV_FIELD = "gpu_gap_stddev_us"
 
+# Artifacts may either be a bare ``{case_key: {sku: metrics}}`` mapping (the
+# original shape, still present in every previously uploaded artifact) or an
+# enveloped document that carries run provenance alongside that same mapping.
+# The nested mapping is byte-identical in both shapes so committed baselines and
+# every consumer of them stay unchanged.
+PAYLOAD_SCHEMA_FIELD = "schema_version"
+PAYLOAD_BASELINES_FIELD = "baselines"
+PAYLOAD_METADATA_FIELD = "run_metadata"
+PAYLOAD_SCHEMA_VERSION = 1
+
 DTYPE_MAP = {
     "U8": "uint8",
     "U16": "uint16",
@@ -143,6 +165,18 @@ _CASE_AXIS_RE = re.compile(r"\[([^\[\]=]+)=([^\[\]]+)\]")
 
 class BaselineError(RuntimeError):
     """Raised when baseline/config/run data violates the hard schema."""
+
+
+class MissingClockProfileError(BaselineError):
+    """Raised when a mapped GPU has no clock for its power/CUDA profile."""
+
+
+class MissingClockConfigurationError(BaselineError):
+    """A mapped GPU/power profile omits the requested CUDA major.
+
+    This is intentionally outside ``MissingClockProfileError`` so callers
+    classify it as a pool-wide configuration error rather than retrying nodes.
+    """
 
 
 @dataclass(frozen=True)
@@ -231,6 +265,21 @@ class BaselineUpdate:
     # (Python GPU time - C++ GPU time) gaps. It is absent when fewer than two
     # paired artifacts are available or the input aggregation lost pairing.
     gpu_gap_stddev_us: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class SkuBaselinePolicy:
+    languages: frozenset[str] = LANGUAGES
+    n_runs: Optional[int] = None
+    required: bool = True
+    # The absolute parity limit is sized for the reference GPUs. A SKU whose kernels
+    # run an order of magnitude slower reaches it on a binding overhead that the
+    # relative limit reads as healthy, so it may raise the absolute one for itself.
+    max_perf_diff_us: Optional[float] = None
+    # A SKU that only ever measures some tiers owes baselines for those alone.
+    # Jetson runs basic only, so requiring advanced rows there would demand data no
+    # pipeline will ever produce.
+    tiers: frozenset[str] = TIERS
 
 
 def _gpu_gap_stats(
@@ -661,9 +710,41 @@ def case_key_from_row(row: pd.Series, ref: ConfigRef) -> str:
     return case_key_from_axis_values(ref.key, row_axis_values(row, ref))
 
 
-def load_sku_map(
-    sku_map_path: Optional[Path] = DEFAULT_SKU_MAP_PATH, *, strict: bool = False
-) -> Dict[Tuple[str, int, int], str]:
+def sku_key_from_metadata(
+    metadata: Mapping[str, Any],
+    *,
+    allow_any_power: bool = False,
+) -> Optional[SkuKey]:
+    """Normalize device metadata into the key used by ``sku_map.json``."""
+    try:
+        return (
+            str(metadata["gpu_name"]).strip(),
+            (
+                None
+                if allow_any_power and metadata["power_cap_w"] is None
+                else int(round(float(metadata["power_cap_w"])))
+            ),
+            int(round(float(metadata["locked_sm_clock_mhz"]))),
+            int(metadata["cuda_major"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def resolve_sku_from_metadata(
+    metadata: Mapping[str, Any], sku_map: Mapping[SkuKey, str]
+) -> Optional[str]:
+    """Route measured metadata, including explicitly power-independent profiles."""
+    key = sku_key_from_metadata(metadata)
+    if key is None:
+        return None
+    name, _power, clock, cuda_major = key
+    return sku_map.get(key) or sku_map.get((name, None, clock, cuda_major))
+
+
+def _load_sku_map_document(
+    sku_map_path: Optional[Path], *, strict: bool
+) -> Mapping[str, Any]:
     if not sku_map_path or not Path(sku_map_path).is_file():
         if strict:
             raise BaselineError(f"sku_map.json not found at {sku_map_path}")
@@ -676,13 +757,36 @@ def load_sku_map(
                 f"could not parse sku_map.json at {sku_map_path}"
             ) from exc
         return {}
+    if not isinstance(raw, dict):
+        if strict:
+            raise BaselineError("sku_map.json root must be an object")
+        return {}
+    return raw
 
-    out: Dict[Tuple[str, int, int], str] = {}
+
+def load_sku_map(
+    sku_map_path: Optional[Path] = DEFAULT_SKU_MAP_PATH, *, strict: bool = False
+) -> Dict[SkuKey, str]:
+    raw = _load_sku_map_document(sku_map_path, strict=strict)
+
+    out: Dict[SkuKey, str] = {}
+    ambiguous_keys: Set[SkuKey] = set()
+    profile_clocks: Dict[Tuple[str, Optional[int], int], int] = {}
     for idx, entry in enumerate(raw.get("entries", [])):
+        if entry.get("routing") == "explicit":
+            continue
+        key = sku_key_from_metadata(entry, allow_any_power=True)
+        if key is None:
+            if strict:
+                raise BaselineError(f"invalid sku_map.json entry #{idx}: {entry!r}")
+            continue
+        if key[3] not in SUPPORTED_CUDA_MAJORS:
+            if strict:
+                raise BaselineError(
+                    f"unsupported CUDA major {key[3]} in sku_map.json entry #{idx}"
+                )
+            continue
         try:
-            name = str(entry["gpu_name"])
-            cap = int(round(float(entry["power_cap_w"])))
-            clock = int(round(float(entry["locked_sm_clock_mhz"])))
             stem = str(entry["stem"])
         except (KeyError, TypeError, ValueError) as exc:
             if strict:
@@ -690,18 +794,214 @@ def load_sku_map(
                     f"invalid sku_map.json entry #{idx}: {entry!r}"
                 ) from exc
             continue
-        out[(name, cap, clock)] = stem
+        if key in ambiguous_keys:
+            continue
+        if strict and any(
+            name == key[0]
+            and cuda == key[3]
+            and power != key[1]
+            and (power is None or key[1] is None)
+            for name, power, _clock, cuda in out
+        ):
+            raise BaselineError(
+                f"overlapping power profiles for {key[0]} / CUDA {key[3]}"
+            )
+        profile = (key[0], key[1], key[3])
+        previous_clock = profile_clocks.get(profile)
+        if strict and previous_clock is not None and previous_clock != key[2]:
+            raise BaselineError(
+                "multiple SM clock targets match hardware profile "
+                f"{profile[0]} @ {profile[1]}W / CUDA {profile[2]}: "
+                f"{sorted({previous_clock, key[2]}, reverse=True)}"
+            )
+        profile_clocks[profile] = key[2]
+        if key in out and out[key] != stem:
+            message = (
+                "multiple SKU stems match hardware "
+                f"{key[0]} @ {key[1]}W / {key[2]}MHz / CUDA {key[3]}: "
+                f"{sorted({out[key], stem})}"
+            )
+            if strict:
+                raise BaselineError(message)
+            del out[key]
+            ambiguous_keys.add(key)
+            continue
+        out[key] = stem
+    return out
+
+
+def sku_map_gpu_names(
+    sku_map: Mapping[SkuKey, str],
+) -> Set[str]:
+    """Return the GPU models represented by a loaded SKU map."""
+    return {name for name, _power, _clock, _cuda in sku_map}
+
+
+def profiles_for_gpu(
+    sku_map: Mapping[SkuKey, str], gpu_name: str
+) -> List[Tuple[Optional[int], int, int]]:
+    """Return the sorted ``(power, clock, CUDA)`` profiles for one GPU."""
+    return sorted(
+        {
+            (power, clock, cuda)
+            for name, power, clock, cuda in sku_map
+            if name == gpu_name
+        },
+        key=lambda profile: (
+            profile[0] if profile[0] is not None else -1,
+            *profile[1:],
+        ),
+    )
+
+
+def validate_sku_map_cuda_coverage(
+    sku_map: Mapping[SkuKey, str],
+) -> None:
+    """Require every mapped GPU/power profile for each supported CUDA major."""
+    required_cuda_majors = set(SUPPORTED_CUDA_MAJORS)
+    cuda_by_profile: Dict[Tuple[str, Optional[int]], Set[int]] = {}
+    for gpu_name, power_cap_w, _clock, cuda_major in sku_map:
+        cuda_by_profile.setdefault((gpu_name, power_cap_w), set()).add(cuda_major)
+    incomplete = {
+        profile: sorted(required_cuda_majors - cuda_majors)
+        for profile, cuda_majors in cuda_by_profile.items()
+        if not required_cuda_majors.issubset(cuda_majors)
+    }
+    if incomplete:
+        raise BaselineError(f"SKU profiles missing CUDA major coverage: {incomplete}")
+
+
+def required_clock_for_profile(
+    sku_map: Mapping[SkuKey, str],
+    *,
+    gpu_name: str,
+    power_cap_w: Optional[int],
+    cuda_major: Optional[int],
+) -> int:
+    """Resolve the one configured clock for a mapped GPU profile."""
+    targets = {
+        clock
+        for power, clock, cuda in profiles_for_gpu(sku_map, gpu_name)
+        if (power is None or power == power_cap_w) and cuda == cuda_major
+    }
+    if not targets:
+        available_cuda = sorted(
+            {
+                cuda
+                for power, _clock, cuda in profiles_for_gpu(sku_map, gpu_name)
+                if power is None or power == power_cap_w
+            }
+        )
+        if available_cuda:
+            raise MissingClockConfigurationError(
+                f"no SM clock target is configured for {gpu_name} @ {power_cap_w}W "
+                f"/ CUDA {cuda_major}; configured CUDA majors: {available_cuda}"
+            )
+        raise MissingClockProfileError(
+            f"no baseline-backed SM clock target matches {gpu_name} @ "
+            f"{power_cap_w}W / CUDA {cuda_major}"
+        )
+    return next(iter(targets))
+
+
+def load_sku_policies(
+    sku_map_path: Optional[Path] = DEFAULT_SKU_MAP_PATH, *, strict: bool = False
+) -> Dict[str, SkuBaselinePolicy]:
+    raw = _load_sku_map_document(sku_map_path, strict=strict)
+
+    out: Dict[str, SkuBaselinePolicy] = {}
+    for idx, entry in enumerate(raw.get("entries", [])):
+        try:
+            stem = str(entry["stem"])
+            baseline = entry.get("baseline", {})
+            if not isinstance(baseline, dict):
+                raise TypeError("baseline must be an object")
+            languages = frozenset(baseline.get("languages", LANGUAGES))
+            if not languages or not languages <= LANGUAGES:
+                raise ValueError(f"invalid languages {sorted(languages)}")
+            n_runs = baseline.get("n_runs")
+            if n_runs is not None and (
+                isinstance(n_runs, bool) or not isinstance(n_runs, int) or n_runs <= 0
+            ):
+                raise ValueError(f"invalid n_runs {n_runs!r}")
+            required = baseline.get("required", True)
+            if not isinstance(required, bool):
+                raise TypeError("required must be boolean")
+            tiers = frozenset(baseline.get("tiers", TIERS))
+            if not tiers or not tiers <= TIERS:
+                raise ValueError(f"invalid tiers {sorted(tiers)}")
+            max_perf_diff_us = baseline.get("max_perf_diff_us")
+            if max_perf_diff_us is not None and (
+                isinstance(max_perf_diff_us, bool)
+                or not isinstance(max_perf_diff_us, (int, float))
+                or max_perf_diff_us <= 0
+            ):
+                raise ValueError(f"invalid max_perf_diff_us {max_perf_diff_us!r}")
+        except (KeyError, TypeError, ValueError) as exc:
+            if strict:
+                raise BaselineError(
+                    f"invalid sku_map.json baseline policy entry #{idx}: {entry!r}"
+                ) from exc
+            continue
+        policy = SkuBaselinePolicy(
+            languages=languages,
+            n_runs=n_runs,
+            required=required,
+            tiers=tiers,
+            max_perf_diff_us=max_perf_diff_us,
+        )
+        if stem in out and out[stem] != policy:
+            if strict:
+                raise BaselineError(
+                    f"conflicting sku_map.json policies for stem {stem!r}"
+                )
+            continue
+        out[stem] = policy
+    return out
+
+
+def explicit_routing_stems(
+    sku_map_path: Optional[Path] = DEFAULT_SKU_MAP_PATH, *, strict: bool = False
+) -> Set[str]:
+    """Stems selected by BASELINE_SKU rather than discovered by nvidia-smi.
+
+    These carry no device metadata to match on, so a consumer cannot confirm their
+    identity the way it does for a hardware-routed SKU -- the run declares it.
+    """
+    raw = _load_sku_map_document(sku_map_path, strict=strict)
+    out: Set[str] = set()
+    for entry in raw.get("entries", []):
+        if entry.get("routing") != "explicit":
+            continue
+        try:
+            out.add(str(entry["stem"]))
+        except (KeyError, TypeError, ValueError):
+            if strict:
+                raise BaselineError(f"invalid explicit sku_map.json entry: {entry!r}")
     return out
 
 
 def sku_stems(
     sku_map_path: Optional[Path] = DEFAULT_SKU_MAP_PATH, *, strict: bool = False
 ) -> Set[str]:
-    return set(load_sku_map(sku_map_path, strict=strict).values())
+    return set(load_sku_policies(sku_map_path, strict=strict))
+
+
+def unmapped_sku_stem(name: str, cap: int, clock: int, cuda_major: int) -> str:
+    """Stable artifact key for a device sku_map.json does not route."""
+    raw = f"{UNMAPPED_SKU_PREFIX}{name}_{cap}W_{clock}MHz_CUDA{cuda_major}"
+    stem = re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_")
+    if not stem.startswith(UNMAPPED_SKU_PREFIX) or stem == UNMAPPED_SKU_PREFIX:
+        raise BaselineError(f"could not name an unmapped SKU for {name!r}")
+    return stem
+
+
+def is_unmapped_sku(sku: str) -> bool:
+    return sku.startswith(UNMAPPED_SKU_PREFIX) and sku != UNMAPPED_SKU_PREFIX
 
 
 def resolve_sku_for_row(
-    row: pd.Series, sku_map: Dict[Tuple[str, int, int], str]
+    row: pd.Series, sku_map: Dict[SkuKey, str], cuda_major: int
 ) -> str:
     missing = [
         column
@@ -715,16 +1015,20 @@ def resolve_sku_for_row(
     clock = int(
         round(_finite_float(row[LOCKED_CLOCK_COLUMN], label=LOCKED_CLOCK_COLUMN))
     )
-    sku = sku_map.get((name, cap, clock))
+    sku = resolve_sku_from_metadata(
+        {
+            "gpu_name": name,
+            "power_cap_w": cap,
+            "locked_sm_clock_mhz": clock,
+            "cuda_major": cuda_major,
+        },
+        sku_map,
+    )
     if not sku:
-        raise BaselineError(f"({name!r}, {cap!r}, {clock!r}) is not in sku_map.json")
+        raise BaselineError(
+            f"({name!r}, {cap!r}, {clock!r}, CUDA {cuda_major}) is not in sku_map.json"
+        )
     return sku
-
-
-def _validate_required_run_columns(df: pd.DataFrame, source: Path) -> None:
-    missing = sorted(RUN_REQUIRED_COLUMNS - set(df.columns))
-    if missing:
-        raise BaselineError(f"{source}: missing required column(s): {missing}")
 
 
 def _row_label(path: Path, row_number: int) -> str:
@@ -737,7 +1041,10 @@ def measurement_from_row(
     source: Path,
     row_number: int,
     index: ConfigIndex,
-    sku_map: Dict[Tuple[str, int, int], str],
+    sku_map: Dict[SkuKey, str],
+    cuda_major: int,
+    baseline_sku: Optional[str] = None,
+    allow_unmapped_sku: bool = False,
 ) -> RunMeasurement:
     config_key = str(row[CONFIG_KEY_COLUMN]).strip()
     ref = index.require(config_key)
@@ -755,7 +1062,24 @@ def measurement_from_row(
             f"Language must be one of {sorted(LANGUAGES)}, got {language!r}"
         )
 
-    sku = resolve_sku_for_row(row, sku_map)
+    if baseline_sku:
+        sku = baseline_sku
+    else:
+        try:
+            sku = resolve_sku_for_row(row, sku_map, cuda_major)
+        except BaselineError as exc:
+            if not (allow_unmapped_sku and "is not in sku_map.json" in str(exc)):
+                raise
+            name = str(row[DEVICE_NAME_COLUMN]).strip()
+            cap = int(
+                round(_finite_float(row[POWER_CAP_COLUMN], label=POWER_CAP_COLUMN))
+            )
+            clock = int(
+                round(
+                    _finite_float(row[LOCKED_CLOCK_COLUMN], label=LOCKED_CLOCK_COLUMN)
+                )
+            )
+            sku = unmapped_sku_stem(name, cap, clock, cuda_major)
     gpu_time_us = _finite_float(row[GPU_TIME_COLUMN], label=GPU_TIME_COLUMN)
     gpu_noise_us = _finite_float(row[GPU_NOISE_US_COLUMN], label=GPU_NOISE_US_COLUMN)
     gpu_bwutil = _finite_float(row[BWUTIL_COLUMN], label=BWUTIL_COLUMN)
@@ -920,13 +1244,31 @@ def measurements_from_dataframe(
     df: pd.DataFrame,
     *,
     index: ConfigIndex,
+    cuda_major: int,
     sku_map_path: Path = DEFAULT_SKU_MAP_PATH,
     source: Path = Path("<dataframe>"),
+    baseline_sku: Optional[str] = None,
+    allow_unmapped_sku: bool = False,
 ) -> List[RunMeasurement]:
     sku_map = load_sku_map(sku_map_path, strict=True)
     errors: List[str] = []
+    if baseline_sku:
+        policies = load_sku_policies(sku_map_path, strict=True)
+        if baseline_sku not in policies:
+            errors.append(
+                f"{source}: explicit baseline SKU {baseline_sku!r} is not in sku_map.json"
+            )
     try:
-        _validate_required_run_columns(df, source)
+        required_columns = RUN_REQUIRED_COLUMNS
+        if baseline_sku:
+            required_columns -= {
+                DEVICE_NAME_COLUMN,
+                POWER_CAP_COLUMN,
+                LOCKED_CLOCK_COLUMN,
+            }
+        missing = sorted(required_columns - set(df.columns))
+        if missing:
+            raise BaselineError(f"{source}: missing required column(s): {missing}")
     except Exception as exc:
         errors.append(f"{source}: {exc}")
 
@@ -942,6 +1284,9 @@ def measurements_from_dataframe(
                         row_number=row_number,
                         index=index,
                         sku_map=sku_map,
+                        cuda_major=cuda_major,
+                        baseline_sku=baseline_sku,
+                        allow_unmapped_sku=allow_unmapped_sku,
                     )
                 )
             except Exception as exc:
@@ -978,11 +1323,20 @@ def baseline_payload_from_dataframe(
     df: pd.DataFrame,
     *,
     index: ConfigIndex,
+    cuda_major: int,
     sku_map_path: Path = DEFAULT_SKU_MAP_PATH,
     source: Path = Path("<dataframe>"),
+    baseline_sku: Optional[str] = None,
+    allow_unmapped_sku: bool = False,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     measurements = measurements_from_dataframe(
-        df, index=index, sku_map_path=sku_map_path, source=source
+        df,
+        index=index,
+        cuda_major=cuda_major,
+        sku_map_path=sku_map_path,
+        source=source,
+        baseline_sku=baseline_sku,
+        allow_unmapped_sku=allow_unmapped_sku,
     )
     return baseline_payload_from_updates(aggregate_measurements(measurements).values())
 
@@ -993,15 +1347,176 @@ def _positive_int(value: Any, *, label: str) -> int:
     return value
 
 
+def split_baseline_payload(
+    payload: Any,
+    *,
+    source: Path = Path("<baseline-json>"),
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Return ``(case-key mapping, run metadata)`` for either payload shape."""
+    if not isinstance(payload, dict):
+        raise BaselineError(f"{source}: baseline JSON root must be an object")
+    if PAYLOAD_SCHEMA_FIELD not in payload:
+        return payload, {}
+
+    version = payload[PAYLOAD_SCHEMA_FIELD]
+    if version != PAYLOAD_SCHEMA_VERSION:
+        raise BaselineError(
+            f"{source}: unsupported {PAYLOAD_SCHEMA_FIELD} {version!r}; "
+            f"this tool understands {PAYLOAD_SCHEMA_VERSION}"
+        )
+    baselines = payload.get(PAYLOAD_BASELINES_FIELD)
+    if not isinstance(baselines, dict):
+        raise BaselineError(
+            f"{source}: enveloped payload must carry an object "
+            f"{PAYLOAD_BASELINES_FIELD!r}"
+        )
+    metadata = payload.get(PAYLOAD_METADATA_FIELD, {})
+    if not isinstance(metadata, dict):
+        raise BaselineError(
+            f"{source}: {PAYLOAD_METADATA_FIELD!r} must be an object when present"
+        )
+    return baselines, metadata
+
+
+def build_baseline_document(
+    baselines: Dict[str, Any],
+    *,
+    run_metadata: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Wrap a case-key mapping in the provenance envelope.
+
+    A bare mapping identifies nothing about the run that produced it, so a
+    series of artifacts cannot be keyed or trusted. The envelope carries that
+    provenance without disturbing the nested mapping.
+    """
+    return {
+        PAYLOAD_SCHEMA_FIELD: PAYLOAD_SCHEMA_VERSION,
+        PAYLOAD_METADATA_FIELD: dict(run_metadata or {}),
+        PAYLOAD_BASELINES_FIELD: baselines,
+    }
+
+
+@dataclass(frozen=True)
+class BenchmarkArtifact:
+    """One benchmark JSON, read and split exactly once."""
+
+    path: Path
+    baselines: Dict[str, Any]
+    run_metadata: Dict[str, Any]
+
+
+def collect_artifact_jsons(paths: Sequence[Path]) -> List[Path]:
+    """Resolve files and non-empty directories into unique JSON artifacts."""
+    jsons: List[Path] = []
+    for path in paths:
+        if not path.exists():
+            raise BaselineError(f"--from path does not exist: {path}")
+        if path.is_file():
+            if path.suffix.lower() != ".json":
+                raise BaselineError(f"--from file is not a .json file: {path}")
+            jsons.append(path)
+        else:
+            found = sorted(path.glob("*.json"))
+            if not found:
+                raise BaselineError(f"--from directory has no *.json files: {path}")
+            jsons.extend(found)
+    if not jsons:
+        raise BaselineError("no input files collected from --from arguments")
+
+    seen: Set[Path] = set()
+    unique: List[Path] = []
+    for path in jsons:
+        resolved = path.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            unique.append(path)
+    return unique
+
+
+def normalize_operator_names(raw: Optional[Sequence[str]]) -> Optional[Set[str]]:
+    """Normalize repeatable and comma-separated operator CLI values."""
+    if not raw:
+        return None
+    operators = {
+        token.strip() for item in raw for token in str(item).split(",") if token.strip()
+    }
+    return operators or None
+
+
+def committed_baseline_metrics(
+    entry: Mapping[str, Any], case_key: str, sku: str
+) -> Mapping[str, Any]:
+    """Return a committed case/SKU metric object, or an empty mapping."""
+    baselines = entry.get("baselines", {})
+    case_payload = baselines.get(case_key, {}) if isinstance(baselines, dict) else {}
+    metrics = case_payload.get(sku, {}) if isinstance(case_payload, dict) else {}
+    return metrics if isinstance(metrics, dict) else {}
+
+
+def committed_baseline_time_us(
+    entry: Mapping[str, Any], case_key: str, sku: str, language: str
+) -> Optional[float]:
+    """Return one committed language timing when present."""
+    time_field, _, _ = METRIC_FIELDS_BY_LANGUAGE[language]
+    value = committed_baseline_metrics(entry, case_key, sku).get(time_field)
+    return (
+        float(value)
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+        else None
+    )
+
+
+def load_artifacts(paths: Sequence[Path]) -> List[BenchmarkArtifact]:
+    """Read and split each artifact once.
+
+    Provenance and measurements live in the same file, so reading it twice to
+    get them separately doubles the I/O and JSON decode of payloads that hold
+    thousands of case keys.
+    """
+    artifacts: List[BenchmarkArtifact] = []
+    errors: List[str] = []
+    for path in paths:
+        try:
+            raw = json.loads(Path(path).read_text())
+            baselines, run_metadata = split_baseline_payload(raw, source=Path(path))
+            artifacts.append(
+                BenchmarkArtifact(
+                    path=Path(path),
+                    baselines=baselines,
+                    run_metadata=run_metadata,
+                )
+            )
+        except Exception as exc:
+            errors.append(f"{path}: {exc}")
+    if errors:
+        raise BaselineError(
+            "unreadable benchmark artifact(s):\n  " + "\n  ".join(errors)
+        )
+    return artifacts
+
+
 def baseline_updates_from_payload(
     payload: Dict[str, Any],
     *,
     index: ConfigIndex,
     sku_stem_set: Set[str],
     source: Path = Path("<baseline-json>"),
+    validated_case_keys: Optional[Set[str]] = None,
+    errors_out: Optional[List[str]] = None,
 ) -> List[BaselineUpdate]:
-    if not isinstance(payload, dict):
-        raise BaselineError(f"{source}: baseline JSON root must be an object")
+    """Turn one payload into updates.
+
+    ``validated_case_keys`` lets a caller reading a wave of artifacts share the
+    case-key validation across them. Every artifact in a wave carries the same
+    couple of thousand case keys, and validating a key against its config is
+    pure, so repeating it per artifact is the dominant cost of loading a wave.
+
+    ``errors_out`` collects per-row problems instead of raising. Importing a
+    baseline must reject a row the current config does not declare, but reading
+    a window of past artifacts must not: a config's declared axis values change
+    over time, so history legitimately contains rows that no longer exist.
+    """
+    payload, _ = split_baseline_payload(payload, source=source)
 
     updates: List[BaselineUpdate] = []
     errors: List[str] = []
@@ -1009,12 +1524,18 @@ def baseline_updates_from_payload(
         try:
             config_key, _ = parse_case_key(case_key)
             ref = index.require(config_key)
-            validate_case_key_for_config(case_key, ref)
+            if validated_case_keys is None:
+                validate_case_key_for_config(case_key, ref)
+            elif case_key not in validated_case_keys:
+                validate_case_key_for_config(case_key, ref)
+                validated_case_keys.add(case_key)
             if not isinstance(case_payload, dict):
                 raise BaselineError("SKU map must be an object")
 
             for sku, metric_payload in case_payload.items():
-                if sku not in sku_stem_set:
+                # unmapped_* is an informative measurement, not a baseline SKU.
+                # Committed files are checked separately and still reject it.
+                if sku not in sku_stem_set and not is_unmapped_sku(str(sku)):
                     raise BaselineError(f"unknown SKU {sku!r}")
                 if not isinstance(metric_payload, dict):
                     raise BaselineError(f"{sku}: metrics must be an object")
@@ -1107,7 +1628,46 @@ def baseline_updates_from_payload(
             errors.append(f"{source}: {case_key}: {exc}")
 
     if errors:
-        raise BaselineError("invalid baseline JSON:\n  " + "\n  ".join(errors))
+        if errors_out is None:
+            raise BaselineError("invalid baseline JSON:\n  " + "\n  ".join(errors))
+        errors_out.extend(errors)
+    return updates
+
+
+def _updates_from_artifacts(
+    artifacts: Sequence[BenchmarkArtifact],
+    *,
+    index: ConfigIndex,
+    sku_map_path: Path,
+    errors_out: Optional[List[str]] = None,
+) -> List[BaselineUpdate]:
+    stems = sku_stems(sku_map_path, strict=True)
+    updates: List[BaselineUpdate] = []
+    errors: List[str] = []
+    # Scoped to this call, so a caller that reloads a different config tree
+    # never sees another tree's validation results.
+    validated_case_keys: Set[str] = set()
+    for artifact in artifacts:
+        try:
+            updates.extend(
+                baseline_updates_from_payload(
+                    artifact.baselines,
+                    index=index,
+                    sku_stem_set=stems,
+                    source=artifact.path,
+                    validated_case_keys=validated_case_keys,
+                    errors_out=errors_out,
+                )
+            )
+        except Exception as exc:
+            errors.append(f"{artifact.path}: {exc}")
+
+    if errors:
+        if errors_out is None:
+            raise BaselineError(
+                "invalid baseline JSON input(s):\n  " + "\n  ".join(errors)
+            )
+        errors_out.extend(errors)
     return updates
 
 
@@ -1117,26 +1677,46 @@ def baseline_updates_from_jsons(
     index: ConfigIndex,
     sku_map_path: Path = DEFAULT_SKU_MAP_PATH,
 ) -> Dict[Tuple[str, str, str], BaselineUpdate]:
-    stems = sku_stems(sku_map_path, strict=True)
-    updates: List[BaselineUpdate] = []
-    errors: List[str] = []
-    for path in paths:
-        try:
-            raw = json.loads(Path(path).read_text())
-            updates.extend(
-                baseline_updates_from_payload(
-                    raw,
-                    index=index,
-                    sku_stem_set=stems,
-                    source=Path(path),
-                )
-            )
-        except Exception as exc:
-            errors.append(f"{path}: {exc}")
+    return baseline_updates_from_artifacts(
+        load_artifacts(paths), index=index, sku_map_path=sku_map_path
+    )
 
-    if errors:
-        raise BaselineError("invalid baseline JSON input(s):\n  " + "\n  ".join(errors))
-    return merge_baseline_updates(updates)
+
+def baseline_updates_from_artifacts(
+    artifacts: Sequence[BenchmarkArtifact],
+    *,
+    index: ConfigIndex,
+    sku_map_path: Path = DEFAULT_SKU_MAP_PATH,
+) -> Dict[Tuple[str, str, str], BaselineUpdate]:
+    """Merge already-loaded artifact observations into baseline updates."""
+    return merge_baseline_updates(
+        _updates_from_artifacts(artifacts, index=index, sku_map_path=sku_map_path)
+    )
+
+
+def baseline_update_samples_from_artifacts(
+    artifacts: Sequence[BenchmarkArtifact],
+    *,
+    index: ConfigIndex,
+    sku_map_path: Path = DEFAULT_SKU_MAP_PATH,
+    errors_out: Optional[List[str]] = None,
+) -> Dict[Tuple[str, str, str], List[BaselineUpdate]]:
+    """Group per-artifact updates by row without collapsing them into a mean.
+
+    Drift analysis needs the individual observations: a shift is only credible
+    when the artifacts agree on it, which a merged mean cannot express.
+
+    Pass ``errors_out`` to skip rows the current config no longer declares
+    rather than failing; a window of past artifacts always contains some.
+    """
+    grouped: Dict[Tuple[str, str, str], List[BaselineUpdate]] = {}
+    for update in _updates_from_artifacts(
+        artifacts, index=index, sku_map_path=sku_map_path, errors_out=errors_out
+    ):
+        grouped.setdefault((update.config_key, update.case_key, update.sku), []).append(
+            update
+        )
+    return grouped
 
 
 def _ordered_metric_object(metrics: Dict[str, Any]) -> Dict[str, Any]:
@@ -1172,6 +1752,9 @@ def apply_updates_to_document(
             )
         metric_payload = dict(case_payload.get(update.sku, {}))
         metric_payload["n_runs"] = update.n_runs
+        for language in LANGUAGES - set(update.language_metrics):
+            for field in METRIC_FIELDS_BY_LANGUAGE[language]:
+                metric_payload.pop(field, None)
         for language, metric in update.language_metrics.items():
             time_field, noise_field, bwutil_field = METRIC_FIELDS_BY_LANGUAGE[language]
             metric_payload[time_field] = metric.gpu_time_us
@@ -1191,16 +1774,30 @@ def apply_updates_to_document(
 def validate_baseline_update_quality(
     update: BaselineUpdate,
     *,
+    policy: Optional[SkuBaselinePolicy] = None,
     criteria: BenchmarkQualityCriteria = DEFAULT_BENCHMARK_QUALITY,
 ) -> List[str]:
     errors: List[str] = []
-    missing_languages = sorted(LANGUAGES - set(update.language_metrics))
+    policy = policy or SkuBaselinePolicy()
+    missing_languages = sorted(policy.languages - set(update.language_metrics))
     if missing_languages:
         errors.append(
             f"{update.case_key}: {update.sku}: missing language metric(s) "
-            f"{missing_languages}; baseline quality requires C++/Python parity"
+            f"{missing_languages}"
         )
         return errors
+    extra_languages = sorted(set(update.language_metrics) - policy.languages)
+    if extra_languages:
+        errors.append(
+            f"{update.case_key}: {update.sku}: unexpected language metric(s) "
+            f"{extra_languages}"
+        )
+        return errors
+    if policy.n_runs is not None and update.n_runs != policy.n_runs:
+        errors.append(
+            f"{update.case_key}: {update.sku}: n_runs must be {policy.n_runs}, "
+            f"got {update.n_runs}"
+        )
 
     for language in sorted(update.language_metrics):
         metric = update.language_metrics[language]
@@ -1223,6 +1820,8 @@ def validate_baseline_update_quality(
     if cpp is None or python is None or cpp.gpu_time_us <= 0:
         return errors
 
+    if policy.max_perf_diff_us is not None:
+        criteria = dataclass_replace(criteria, max_perf_diff_us=policy.max_perf_diff_us)
     diff_pct, diff_us = criteria.parity_deltas(cpp.gpu_time_us, python.gpu_time_us)
     if criteria.relative_parity_exceeds_limit(diff_pct):
         errors.append(
@@ -1242,11 +1841,15 @@ def validate_baseline_update_quality(
 def validate_baseline_updates_quality(
     updates: Iterable[BaselineUpdate],
     *,
+    policies: Optional[Mapping[str, SkuBaselinePolicy]] = None,
     criteria: BenchmarkQualityCriteria = DEFAULT_BENCHMARK_QUALITY,
 ) -> List[str]:
     errors: List[str] = []
     for update in updates:
-        errors.extend(validate_baseline_update_quality(update, criteria=criteria))
+        policy = policies.get(update.sku) if policies is not None else None
+        errors.extend(
+            validate_baseline_update_quality(update, policy=policy, criteria=criteria)
+        )
     return errors
 
 
@@ -1255,10 +1858,35 @@ def validate_baselines_in_document(
     index: ConfigIndex,
     sku_stem_set: Set[str],
     *,
+    sku_policies: Optional[Mapping[str, SkuBaselinePolicy]] = None,
     config_key_filter: Optional[Set[str]] = None,
     criteria: BenchmarkQualityCriteria = DEFAULT_BENCHMARK_QUALITY,
+    prepare_first_seed: bool = False,
 ) -> List[str]:
     errors: List[str] = []
+    if (
+        BASELINE_REFRESH_INCOMPLETE_FIELD in doc.raw
+        and doc.raw[BASELINE_REFRESH_INCOMPLETE_FIELD] is not True
+    ):
+        errors.append(
+            f"{doc.path}: {BASELINE_REFRESH_INCOMPLETE_FIELD} must be the JSON "
+            "literal true when present"
+        )
+    policies = {
+        stem: (sku_policies or {}).get(stem, SkuBaselinePolicy())
+        for stem in sku_stem_set
+    }
+    required_by_tier: Dict[str, Set[str]] = {
+        tier: {
+            stem
+            for stem, policy in policies.items()
+            if policy.required and tier in policy.tiers
+        }
+        for tier in TIERS
+    }
+    # A config with no declared tier owes every required SKU; only an explicit tier
+    # narrows the set, so a malformed entry cannot silently drop coverage.
+    all_required = {stem for stem, policy in policies.items() if policy.required}
     for config_key, entry in doc.configs.items():
         if config_key_filter is not None and config_key not in config_key_filter:
             continue
@@ -1267,7 +1895,7 @@ def validate_baselines_in_document(
             errors.append(f"{doc.path}: config {config_key!r} is not indexed")
             continue
         baselines = entry.get("baselines", {})
-        if baselines is None:
+        if baselines is None and not prepare_first_seed:
             baselines = {}
         if not isinstance(baselines, dict):
             errors.append(f"{doc.path}: {config_key}: baselines must be an object")
@@ -1278,14 +1906,25 @@ def validate_baselines_in_document(
             errors.append(f"{doc.path}: {config_key}: {exc}")
             continue
         for case_key in expected_case_keys:
+            if prepare_first_seed:
+                try:
+                    validate_case_key_for_config(case_key, ref)
+                except BaselineError as exc:
+                    errors.append(f"{doc.path}: {config_key}: {case_key}: {exc}")
+                    continue
             case_payload = baselines.get(case_key)
             if case_payload is None:
-                errors.append(
-                    f"{doc.path}: {config_key}: missing baseline case {case_key}"
-                )
+                if not prepare_first_seed or case_key in baselines:
+                    errors.append(
+                        f"{doc.path}: {config_key}: missing baseline case {case_key}"
+                    )
                 continue
             if isinstance(case_payload, dict):
-                missing_skus = sorted(sku_stem_set - set(case_payload))
+                entry_tier = entry.get("tier")
+                required_skus = required_by_tier.get(
+                    entry_tier if isinstance(entry_tier, str) else "", all_required
+                )
+                missing_skus = sorted(required_skus - set(case_payload))
                 if missing_skus:
                     errors.append(
                         f"{doc.path}: {config_key}: {case_key}: "
@@ -1313,10 +1952,26 @@ def validate_baselines_in_document(
                         "metrics must be an object"
                     )
                     continue
-                missing = [
+                policy = policies.get(sku, SkuBaselinePolicy())
+                unexpected_fields = sorted(
                     field
-                    for field in BASELINE_METRIC_FIELDS
-                    if field not in metric_payload
+                    for language in LANGUAGES - policy.languages
+                    for field in METRIC_FIELDS_BY_LANGUAGE[language]
+                    if field in metric_payload
+                )
+                if unexpected_fields:
+                    errors.append(
+                        f"{doc.path}: {config_key}: {case_key}: {sku}: "
+                        f"unexpected metric field(s) {unexpected_fields}"
+                    )
+                    continue
+                required_fields = ["n_runs"] + [
+                    field
+                    for language in sorted(policy.languages)
+                    for field in METRIC_FIELDS_BY_LANGUAGE[language]
+                ]
+                missing = [
+                    field for field in required_fields if field not in metric_payload
                 ]
                 if missing:
                     errors.append(
@@ -1336,7 +1991,7 @@ def validate_baselines_in_document(
                         f"n_runs must be a positive integer, got {n_runs!r}"
                     )
                 language_metrics: Dict[str, LanguageMetric] = {}
-                for field_name in BASELINE_METRIC_FIELDS[1:]:
+                for field_name in required_fields[1:]:
                     value = metric_payload[field_name]
                     if isinstance(value, bool) or not isinstance(value, (int, float)):
                         metric_errors.append(
@@ -1351,6 +2006,11 @@ def validate_baselines_in_document(
                         )
                 gpu_gap_stddev_us = None
                 if GPU_GAP_STDDEV_FIELD in metric_payload:
+                    if policy.languages != LANGUAGES:
+                        metric_errors.append(
+                            f"{doc.path}: {config_key}: {case_key}: {sku}: "
+                            f"{GPU_GAP_STDDEV_FIELD} requires paired C++/Python metrics"
+                        )
                     value = metric_payload[GPU_GAP_STDDEV_FIELD]
                     if isinstance(value, bool) or not isinstance(value, (int, float)):
                         metric_errors.append(
@@ -1374,7 +2034,8 @@ def validate_baselines_in_document(
                 if metric_errors:
                     errors.extend(metric_errors)
                     continue
-                for language, fields in METRIC_FIELDS_BY_LANGUAGE.items():
+                for language in sorted(policy.languages):
+                    fields = METRIC_FIELDS_BY_LANGUAGE[language]
                     time_field, noise_field, bwutil_field = fields
                     language_metrics[language] = LanguageMetric(
                         gpu_time_us=float(metric_payload[time_field]),
@@ -1391,7 +2052,7 @@ def validate_baselines_in_document(
                     gpu_gap_stddev_us=gpu_gap_stddev_us,
                 )
                 for quality_error in validate_baseline_update_quality(
-                    update, criteria=criteria
+                    update, policy=policy, criteria=criteria
                 ):
                     errors.append(f"{doc.path}: {config_key}: {quality_error}")
     return errors

@@ -18,6 +18,7 @@ import pytest
 
 import cvcuda
 import cvcuda_tools as cv_tools
+import cvcuda_util
 import cupy
 
 # NOTE: The following tests for resize_crop_convert_reformat DO NOT TEST:
@@ -214,12 +215,51 @@ import cupy
             True,
         ),
         (
+            ((4, 512, 512, 3), np.uint8, "NHWC"),  # F16 output
+            (256, 256),
+            cvcuda.Interp.LINEAR,
+            (0, 0, 224, 224),
+            "NCHW",
+            cvcuda.Type.F16,
+            cvcuda.ChannelManip.REVERSE,
+            (4, 3, 224, 224),
+            1,
+            0,
+            True,
+        ),
+        (
+            ((512, 512, 3), np.uint8, "HWC"),  # F16 output, single image
+            (256, 256),
+            cvcuda.Interp.NEAREST,
+            (0, 0, 224, 224),
+            "HWC",
+            cvcuda.Type.F16,
+            cvcuda.ChannelManip.NO_OP,
+            (224, 224, 3),
+            1,
+            0,
+            True,
+        ),
+        (
             ((512, 1024, 3), np.float32, "HWC"),  # Unsupported input dtype
             (1024, 256),
             cvcuda.Interp.LINEAR,
             (0, 0, 1024, 224),
             "CHW",
             cvcuda.Type.F32,
+            cvcuda.ChannelManip.REVERSE,
+            (3, 224, 1024),
+            1,
+            0,
+            False,  # Negative test
+        ),
+        (
+            ((512, 1024, 3), np.float16, "HWC"),  # F16 input stays unsupported
+            (1024, 256),
+            cvcuda.Interp.LINEAR,
+            (0, 0, 1024, 224),
+            "CHW",
+            cvcuda.Type.F16,
             cvcuda.ChannelManip.REVERSE,
             (3, 224, 1024),
             1,
@@ -281,7 +321,9 @@ def test_op_resize_crop_convert_reformat(
     is_positive_test,
 ):
 
-    inputTensor = cvcuda.Tensor(*tensor_params)
+    inputTensor = cvcuda_util.create_tensor(
+        *tensor_params, rng=np.random.default_rng(0)
+    )
     out_layout = out_layout if out_layout else str(inputTensor.layout)
     out_dtype = out_dtype if out_dtype else inputTensor.dtype
 
@@ -317,7 +359,7 @@ def test_op_resize_crop_convert_reformat(
             inputTensor,
             resize_dim,
             resize_interpolation,
-            [crop_rect_params[1], crop_rect_params[0]],
+            crop_rect_params[:2],
             manip=manip,
             scale=scale_norm,
             offset=offset_norm,
@@ -436,6 +478,21 @@ def test_op_resize_crop_convert_reformat(
             0,
             True,
         ),
+        (
+            10,  # F16 output from the u8 var-shape batch
+            (50, 50),
+            (512, 512),
+            (256, 256),
+            cvcuda.Interp.LINEAR,
+            (0, 0, 224, 224),
+            "NCHW",
+            cvcuda.Type.F16,
+            cvcuda.ChannelManip.REVERSE,
+            (10, 3, 224, 224),
+            1,
+            0,
+            True,
+        ),
     ],
 )
 def test_op_resize_crop_convert_reformat_varshape(
@@ -503,7 +560,7 @@ def test_op_resize_crop_convert_reformat_varshape(
             inputVarShape,
             resize_dim,
             resize_interpolation,
-            [crop_rect_params[1], crop_rect_params[0]],
+            crop_rect_params[:2],
             manip=manip,
         )
     except Exception as e:

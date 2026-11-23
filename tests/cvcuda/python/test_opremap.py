@@ -61,12 +61,34 @@ CALC_REF = {
     "flipB": lambda a: a[:, ::-1, ::-1, :] if len(a.shape) == 4 else a[::-1, ::-1, :],
 }
 REF_SHAPE = {
-    "absolute": lambda s, m: s.shape[0:1] + m.shape[1:3] + s.shape[3:]
-    if len(s.shape) == 4
-    else m.shape[0:2] + s.shape[2:],
+    "absolute": lambda s, m: (
+        s.shape[0:1] + m.shape[1:3] + s.shape[3:]
+        if len(s.shape) == 4
+        else m.shape[0:2] + s.shape[2:]
+    ),
     "relative": lambda s, m: s.shape,
 }
 REF_SHAPE["default"] = REF_SHAPE["absolute"]
+
+
+def test_op_remap_constant_coverage_tensor_only():
+    src = cvcuda.Tensor((1, 4, 4, 1), cvcuda.Type.U8, "NHWC")
+    map_tensor = cvcuda.Tensor((1, 4, 4, 1), cvcuda.Type._2F32, "NHWC")
+    kwargs = {
+        "src_interp": cvcuda.Interp.LINEAR,
+        "border": cvcuda.Border.CONSTANT_COVERAGE,
+        "border_value": [0.5],
+    }
+    assert isinstance(cvcuda.remap(src, map_tensor, **kwargs), cvcuda.Tensor)
+    dst = cvcuda.Tensor(src.shape, src.dtype, src.layout)
+    assert cvcuda.remap_into(dst, src, map_tensor, **kwargs) is dst
+
+    batch = util.create_image_batch(1, cvcuda.Format.U8, size=(4, 4))
+    batch_dst = util.clone_image_batch(batch)
+    with pytest.raises(RuntimeError):
+        cvcuda.remap(batch, map_tensor, **kwargs)
+    with pytest.raises(RuntimeError):
+        cvcuda.remap_into(batch_dst, batch, map_tensor, **kwargs)
 
 
 @pytest.mark.parametrize(
@@ -87,6 +109,22 @@ REF_SHAPE["default"] = REF_SHAPE["absolute"]
         (
             ((13, 21, 1), cvcuda.Type._4U8, "HWC"),
             ((11, 22, 1), cvcuda.Type._2F32, "HWC"),
+        ),
+        (
+            ((5, 16, 23, 3), cvcuda.Type.F32, "NHWC"),
+            ((5, 17, 13, 2), cvcuda.Type.F32, "NHWC"),
+        ),
+        (
+            ((5, 16, 23, 4), cvcuda.Type.F16, "NHWC"),
+            ((5, 17, 13, 2), cvcuda.Type.F32, "NHWC"),
+        ),
+        (
+            ((13, 21, 1), cvcuda.Type._3F16, "HWC"),
+            ((22, 11, 1), cvcuda.Type._2F32, "HWC"),
+        ),
+        (
+            ((13, 21, 1), cvcuda.Type._4F32, "HWC"),
+            ((22, 11, 1), cvcuda.Type._2F32, "HWC"),
         ),
     ],
 )
@@ -145,6 +183,45 @@ def test_op_remap_rejects_border_value_longer_than_float4():
             border=cvcuda.Border.CONSTANT,
             border_value=np.arange(5, dtype=np.float32),
         )
+
+
+def test_op_remap_planar_many_channels_border():
+    src = util.to_cvcuda_tensor(np.full((1, 5, 8, 8), 29, dtype=np.uint8), "NCHW")
+    map_tensor = util.to_cvcuda_tensor(
+        np.full((1, 8, 8, 2), -20, dtype=np.float32), "NHWC"
+    )
+    border = cvcuda.Border.CONSTANT
+    dst = cvcuda.remap(src, map_tensor, border=border, border_value=[7, 7, 7, 7])
+    np.testing.assert_array_equal(cupy.asarray(dst.cuda()).get(), 7)
+    with pytest.raises(RuntimeError):
+        cvcuda.remap(src, map_tensor, border=border, border_value=[7, 8, 7, 7])
+
+
+def test_op_remap_border_value_binding_contract():
+    t_src = cvcuda.Tensor((1, 4, 4, 3), cvcuda.Type.U8, "NHWC")
+    t_map = cvcuda.Tensor((1, 4, 4, 2), cvcuda.Type.F32, "NHWC")
+    t_dst = cvcuda.Tensor(t_src.shape, t_src.dtype, t_src.layout)
+
+    for function in (cvcuda.remap, cvcuda.remap_into):
+        assert "= array([], dtype=float32)" in function.__doc__
+        assert "*, stream:" in function.__doc__
+
+    assert isinstance(cvcuda.remap(t_src, t_map, border_value=None), cvcuda.Tensor)
+    assert cvcuda.remap_into(t_dst, t_src, t_map, border_value=None) is t_dst
+
+    positional_arguments = (
+        t_src,
+        t_map,
+        cvcuda.Interp.NEAREST,
+        cvcuda.Interp.NEAREST,
+        cvcuda.Remap.ABSOLUTE,
+        False,
+        cvcuda.Border.CONSTANT,
+        np.empty(0, dtype=np.float32),
+        cvcuda.Stream(),
+    )
+    with pytest.raises(TypeError):
+        cvcuda.remap(*positional_arguments)
 
 
 @pytest.mark.parametrize(
@@ -207,6 +284,7 @@ def test_op_remap_content(map_type, map_kind, num_maps, num_imgs, img_size, img_
         (11, cvcuda.Format.RGB8, (33, 32)),
         (8, cvcuda.Format.RGBA8, (13, 42)),
         (3, cvcuda.Format.F32, (53, 68)),
+        (3, cvcuda.Format.F16, (53, 68)),
     ],
 )
 def test_op_remapvarshape_api(num_images, img_format, max_size):
@@ -294,13 +372,15 @@ globals().update(
             ("image_batch", cvcuda.remap, _remap_varshape_params),
         ],
         keystone_dlc=(cvcuda.Type.U8, "NHWC", 3),
-        supported_dtypes={cvcuda.Type.U8, cvcuda.Type.F32},
+        supported_dtypes={cvcuda.Type.U8, cvcuda.Type.F16, cvcuda.Type.F32},
         supported_layouts={"NHWC", "HWC", "NCHW", "CHW"},
         supported_channels={1, 3, 4},
-        # F32 only supports channel 1
+        # F32 and F16 only support channel 1
         exclude_dlc=[
             (cvcuda.Type.F32, None, 3),
             (cvcuda.Type.F32, None, 4),
+            (cvcuda.Type.F16, None, 3),
+            (cvcuda.Type.F16, None, 4),
         ],
     )
 )

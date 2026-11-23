@@ -26,8 +26,10 @@
 #include <nvcv/Tensor.hpp>
 #include <nvcv/TensorDataAccess.hpp>
 
+#include <algorithm>
 #include <iostream>
 #include <random>
+#include <utility>
 #include <vector>
 
 namespace test  = nvcv::test;
@@ -104,7 +106,11 @@ NVCV_TYPED_TEST_SUITE(
                              NVCV_TEST_ROW(56, 49, 2, NVCV_IMAGE_FORMAT_RGBA8p, NVCV_IMAGE_FORMAT_RGBA8, uchar),
                              NVCV_TEST_ROW(56, 49, 3, NVCV_IMAGE_FORMAT_RGB8, NVCV_IMAGE_FORMAT_RGB8p, uchar),
                              NVCV_TEST_ROW(31, 30, 3, NVCV_IMAGE_FORMAT_RGBAf32, NVCV_IMAGE_FORMAT_RGBAf32p, float),
-                             NVCV_TEST_ROW(30, 31, 3, NVCV_IMAGE_FORMAT_RGBf32p, NVCV_IMAGE_FORMAT_RGBf32, float)>);
+                             NVCV_TEST_ROW(30, 31, 3, NVCV_IMAGE_FORMAT_RGBf32p, NVCV_IMAGE_FORMAT_RGBf32, float),
+                             // Reformat moves values without arithmetic, so F16 verifies as
+                             // opaque 16-bit patterns through the ushort reference.
+                             NVCV_TEST_ROW(31, 30, 3, NVCV_IMAGE_FORMAT_RGBAf16, NVCV_IMAGE_FORMAT_RGBAf16p, ushort),
+                             NVCV_TEST_ROW(30, 31, 3, NVCV_IMAGE_FORMAT_RGBf16p, NVCV_IMAGE_FORMAT_RGBf16, ushort)>);
 
 #undef NVCV_TEST_ROW
 
@@ -233,22 +239,24 @@ static nvcv::Tensor WrapU8C1Tensor(NVCVByte *basePtr, nvcv::TensorLayout layout,
 }
 
 static void RunU8C1PaddedStrideCase(nvcv::TensorLayout srcLayout, nvcv::TensorLayout dstLayout, int batches,
-                                    int height = 5, int width = 37)
+                                    int height = 5, int width = 37, int srcRowPadding = 11, int dstRowPadding = 27,
+                                    int srcOffset = 0, int dstOffset = 0, int srcSamplePadding = 16,
+                                    int dstSamplePadding = 32, std::vector<uint8_t> *output = nullptr)
 {
-    const int         srcRowStride    = width + 11;
-    const int         dstRowStride    = width + 27;
-    const int         srcSampleStride = srcRowStride * height + 16;
-    const int         dstSampleStride = dstRowStride * height + 32;
+    const int         srcRowStride    = width + srcRowPadding;
+    const int         dstRowStride    = width + dstRowPadding;
+    const int         srcSampleStride = srcRowStride * height + srcSamplePadding;
+    const int         dstSampleStride = dstRowStride * height + dstSamplePadding;
     constexpr uint8_t srcPadding      = 0xA5;
     constexpr uint8_t dstPadding      = 0xD7;
 
     NVCVByte *srcPtr = nullptr;
     NVCVByte *dstPtr = nullptr;
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&srcPtr, batches * srcSampleStride));
-    ASSERT_EQ(cudaSuccess, cudaMalloc(&dstPtr, batches * dstSampleStride));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&srcPtr, srcOffset + batches * srcSampleStride));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&dstPtr, dstOffset + batches * dstSampleStride));
 
-    std::vector<uint8_t> src(batches * srcSampleStride, srcPadding);
-    std::vector<uint8_t> dst(batches * dstSampleStride, dstPadding);
+    std::vector<uint8_t> src(srcOffset + batches * srcSampleStride, srcPadding);
+    std::vector<uint8_t> dst(dstOffset + batches * dstSampleStride, dstPadding);
     std::vector<uint8_t> expected = dst;
     for (int b = 0; b < batches; ++b)
     {
@@ -256,9 +264,9 @@ static void RunU8C1PaddedStrideCase(nvcv::TensorLayout srcLayout, nvcv::TensorLa
         {
             for (int x = 0; x < width; ++x)
             {
-                const auto value                                = static_cast<uint8_t>(b * 73 + y * 19 + x * 7 + 11);
-                src[b * srcSampleStride + y * srcRowStride + x] = value;
-                expected[b * dstSampleStride + y * dstRowStride + x] = value;
+                const auto value = static_cast<uint8_t>(b * 73 + y * 19 + x * 7 + (x >> 8) * 13 + 11);
+                src[srcOffset + b * srcSampleStride + y * srcRowStride + x]      = value;
+                expected[dstOffset + b * dstSampleStride + y * dstRowStride + x] = value;
             }
         }
     }
@@ -266,8 +274,10 @@ static void RunU8C1PaddedStrideCase(nvcv::TensorLayout srcLayout, nvcv::TensorLa
     ASSERT_EQ(cudaSuccess, cudaMemcpy(srcPtr, src.data(), src.size(), cudaMemcpyHostToDevice));
     ASSERT_EQ(cudaSuccess, cudaMemcpy(dstPtr, dst.data(), dst.size(), cudaMemcpyHostToDevice));
 
-    nvcv::Tensor srcTensor = WrapU8C1Tensor(srcPtr, srcLayout, batches, height, width, srcRowStride, srcSampleStride);
-    nvcv::Tensor dstTensor = WrapU8C1Tensor(dstPtr, dstLayout, batches, height, width, dstRowStride, dstSampleStride);
+    nvcv::Tensor srcTensor
+        = WrapU8C1Tensor(srcPtr + srcOffset, srcLayout, batches, height, width, srcRowStride, srcSampleStride);
+    nvcv::Tensor dstTensor
+        = WrapU8C1Tensor(dstPtr + dstOffset, dstLayout, batches, height, width, dstRowStride, dstSampleStride);
 
     cudaStream_t stream;
     ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
@@ -286,6 +296,10 @@ static void RunU8C1PaddedStrideCase(nvcv::TensorLayout srcLayout, nvcv::TensorLa
     ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
     ASSERT_EQ(cudaSuccess, cudaFree(srcPtr));
     ASSERT_EQ(cudaSuccess, cudaFree(dstPtr));
+    if (output != nullptr)
+    {
+        *output = std::move(got);
+    }
 }
 
 TEST(OpReformat, u8_c1_padded_strides_preserve_canaries)
@@ -296,6 +310,52 @@ TEST(OpReformat, u8_c1_padded_strides_preserve_canaries)
     RunU8C1PaddedStrideCase(nvcv::TENSOR_NHWC, nvcv::TENSOR_NCHW, 3);
 }
 
+TEST(OpReformat, u8_c1_vector_boundaries_preserve_canaries)
+{
+    for (const int2 size : {
+             int2{ 15,   1},
+             int2{ 16,   7},
+             int2{ 17,   8},
+             int2{511,   9},
+             int2{512,  17},
+             int2{513,   9},
+             int2{639, 480},
+             int2{640, 480},
+             int2{641, 480}
+    })
+    {
+        SCOPED_TRACE(size.x);
+        SCOPED_TRACE(size.y);
+        const int padding = (16 - size.x % 16) % 16;
+        RunU8C1PaddedStrideCase(nvcv::TENSOR_NCHW, nvcv::TENSOR_NHWC, 3, size.y, size.x, padding + 16, padding + 32);
+    }
+    RunU8C1PaddedStrideCase(nvcv::TENSOR_NCHW, nvcv::TENSOR_NHWC, 3, 17, 641, 32, 50);
+    RunU8C1PaddedStrideCase(nvcv::TENSOR_NCHW, nvcv::TENSOR_NHWC, 3, 17, 641, 31, 47, 1, 3);
+}
+
+TEST(OpReformat, u8_c1_tall_pitched_tensor_preserves_canaries)
+{
+    RunU8C1PaddedStrideCase(nvcv::TENSOR_NCHW, nvcv::TENSOR_NHWC, 2, 524288, 16, 16, 32);
+}
+
+TEST(OpReformat, u8_c1_large_batch_vector_preserves_canaries)
+{
+    for (const int batches : {65535, 65536, 131071})
+    {
+        SCOPED_TRACE(batches);
+        RunU8C1PaddedStrideCase(nvcv::TENSOR_NCHW, nvcv::TENSOR_NHWC, batches, 1, 16, 16, 32, 0, 0, 0, 0);
+    }
+}
+
+TEST(OpReformat, u8_c1_large_batch_generic_preserves_canaries)
+{
+    for (const int batches : {65535, 65536, 131071})
+    {
+        SCOPED_TRACE(batches);
+        RunU8C1PaddedStrideCase(nvcv::TENSOR_NHWC, nvcv::TENSOR_NCHW, batches, 1, 16, 16, 32, 0, 0, 0, 0);
+    }
+}
+
 TEST(OpReformat, u8_c1_large_image_pitched_copy_preserves_canaries)
 {
     constexpr int batches = 8;
@@ -304,6 +364,96 @@ TEST(OpReformat, u8_c1_large_image_pitched_copy_preserves_canaries)
 
     RunU8C1PaddedStrideCase(nvcv::TENSOR_NCHW, nvcv::TENSOR_NHWC, batches, height, width);
     RunU8C1PaddedStrideCase(nvcv::TENSOR_NHWC, nvcv::TENSOR_NCHW, batches, height, width);
+}
+
+TEST(OpReformatPlanar, u8_c1_pitched_matches_interleaved)
+{
+    // Only the zero/zero case has packed samples on both sides; the others must retain batch gaps.
+    for (const int2 samplePadding : {
+             int2{ 0,  0},
+             int2{16,  0},
+             int2{ 0, 32},
+             int2{16, 32}
+    })
+    {
+        SCOPED_TRACE(samplePadding.x);
+        SCOPED_TRACE(samplePadding.y);
+        std::vector<uint8_t> interleaved;
+        std::vector<uint8_t> planar;
+        RunU8C1PaddedStrideCase(nvcv::TENSOR_NCHW, nvcv::TENSOR_NHWC, 2, 900, 1600, 11, 27, 1, 3, samplePadding.x,
+                                samplePadding.y, &interleaved);
+        RunU8C1PaddedStrideCase(nvcv::TENSOR_NHWC, nvcv::TENSOR_NCHW, 2, 900, 1600, 11, 27, 1, 3, samplePadding.x,
+                                samplePadding.y, &planar);
+        ASSERT_FALSE(interleaved.empty());
+        EXPECT_EQ(interleaved, planar);
+    }
+}
+
+TEST(OpReformat, u8_c1_packed_samples_tall_copy_preserves_canaries)
+{
+    // The combined copy height exceeds 16 bits; one side also has no row padding.
+    RunU8C1PaddedStrideCase(nvcv::TENSOR_NCHW, nvcv::TENSOR_NHWC, 2, 32769, 288, 0, 16, 0, 0, 0, 0);
+    RunU8C1PaddedStrideCase(nvcv::TENSOR_NHWC, nvcv::TENSOR_NCHW, 2, 32769, 288, 16, 0, 0, 0, 0, 0);
+}
+
+static void RunU8C1CrossSampleAliasCase(bool reverse)
+{
+    constexpr int batches      = 2;
+    constexpr int height       = 900;
+    constexpr int width        = 1600;
+    constexpr int rowStride    = width + 16;
+    constexpr int sampleStride = rowStride * height;
+    constexpr int guard        = 3;
+    SCOPED_TRACE(reverse);
+    const int            srcOffset = guard + (reverse ? sampleStride : 0);
+    const int            dstOffset = guard + (reverse ? 0 : sampleStride);
+    std::vector<uint8_t> input(3 * sampleStride + 2 * guard, 0xE1);
+    for (int batch = 0; batch < 3; ++batch)
+    {
+        std::fill_n(input.begin() + guard + batch * sampleStride, sampleStride, static_cast<uint8_t>(0xA0 + batch));
+        for (int row = 0; row < height; ++row)
+        {
+            for (int column = 0; column < width; ++column)
+            {
+                input[guard + batch * sampleStride + row * rowStride + column]
+                    = static_cast<uint8_t>(batch * 73 + row * 19 + column * 7 + 11);
+            }
+        }
+    }
+    std::vector<uint8_t> expected = input;
+    // Each original sample copy is disjoint, but later samples can read earlier output.
+    for (int batch = 0; batch < batches; ++batch)
+    {
+        for (int row = 0; row < height; ++row)
+        {
+            std::copy_n(expected.begin() + srcOffset + batch * sampleStride + row * rowStride, width,
+                        expected.begin() + dstOffset + batch * sampleStride + row * rowStride);
+        }
+    }
+
+    NVCVByte *storage = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&storage, input.size()));
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(storage, input.data(), input.size(), cudaMemcpyHostToDevice));
+    auto src = WrapU8C1Tensor(storage + srcOffset, reverse ? nvcv::TENSOR_NHWC : nvcv::TENSOR_NCHW, batches, height,
+                              width, rowStride, sampleStride);
+    auto dst = WrapU8C1Tensor(storage + dstOffset, reverse ? nvcv::TENSOR_NCHW : nvcv::TENSOR_NHWC, batches, height,
+                              width, rowStride, sampleStride);
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+    cvcuda::Reformat op;
+    EXPECT_NO_THROW(op(stream, src, dst));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+    std::vector<uint8_t> got(input.size());
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(got.data(), storage, got.size(), cudaMemcpyDeviceToHost));
+    EXPECT_EQ(expected, got);
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+    ASSERT_EQ(cudaSuccess, cudaFree(storage));
+}
+
+TEST(OpReformat, u8_c1_cross_sample_alias_preserves_copy_order)
+{
+    ASSERT_NO_FATAL_FAILURE(RunU8C1CrossSampleAliasCase(false));
+    ASSERT_NO_FATAL_FAILURE(RunU8C1CrossSampleAliasCase(true));
 }
 
 struct U8ReformatSpec
@@ -422,7 +572,7 @@ static void SetU8ReformatPixel(std::vector<uint8_t> &src, std::vector<uint8_t> &
 }
 
 static void RunU8BitExactCase(nvcv::TensorLayout srcLayout, nvcv::TensorLayout dstLayout, int batches, int channels,
-                              int height, int width)
+                              int height, int width, int rowPadding = 0, int samplePadding = 0)
 {
     ASSERT_EQ(HasBatch(srcLayout), HasBatch(dstLayout));
     if (!HasBatch(srcLayout))
@@ -430,8 +580,10 @@ static void RunU8BitExactCase(nvcv::TensorLayout srcLayout, nvcv::TensorLayout d
         ASSERT_EQ(batches, 1);
     }
 
-    const U8ReformatSpec srcSpec = MakeU8ReformatSpec(srcLayout, batches, channels, height, width);
-    const U8ReformatSpec dstSpec = MakeU8ReformatSpec(dstLayout, batches, channels, height, width);
+    const U8ReformatSpec srcSpec
+        = MakeU8ReformatSpec(srcLayout, batches, channels, height, width, rowPadding, samplePadding);
+    const U8ReformatSpec dstSpec
+        = MakeU8ReformatSpec(dstLayout, batches, channels, height, width, rowPadding, samplePadding);
 
     std::vector<uint8_t> src(U8StorageSize(srcSpec), 0xA5);
     std::vector<uint8_t> dst(U8StorageSize(dstSpec), 0xD7);
@@ -476,6 +628,17 @@ TEST(OpReformat, u8_c2_odd_tail_bit_exact)
 {
     RunU8BitExactCase(nvcv::TENSOR_NCHW, nvcv::TENSOR_NHWC, 3, 2, 19, 131);
     RunU8BitExactCase(nvcv::TENSOR_NHWC, nvcv::TENSOR_NCHW, 3, 2, 19, 131);
+}
+
+TEST(OpReformat, u8_c3_vector_body_and_tail_bit_exact)
+{
+    RunU8BitExactCase(nvcv::TENSOR_NCHW, nvcv::TENSOR_NHWC, 3, 3, 5, 24);
+    RunU8BitExactCase(nvcv::TENSOR_NCHW, nvcv::TENSOR_NHWC, 3, 3, 5, 20, 4);
+}
+
+TEST(OpReformat, u8_c3_unaligned_stride_falls_back_bit_exact)
+{
+    RunU8BitExactCase(nvcv::TENSOR_NCHW, nvcv::TENSOR_NHWC, 3, 3, 5, 19, 5);
 }
 
 TEST(OpReformat, u8_c1_contiguous_rank4_copy)
@@ -547,6 +710,30 @@ TEST(OpReformat_Negative, mismatched_extents)
     ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
 }
 
+TEST(OpReformat_Negative, rejects_non_inverse_image_layouts)
+{
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+
+    nvcv::Tensor inTensor(
+        {
+            {1, 5, 37, 1},
+            "NHWC"
+    },
+        nvcv::TYPE_U8);
+    nvcv::Tensor outTensor(
+        {
+            {5, 37, 1},
+            "HWC"
+    },
+        nvcv::TYPE_U8);
+
+    cvcuda::Reformat op;
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT, nvcv::ProtectCall([&] { op(stream, inTensor, outTensor); }));
+
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
 // clang-format off
 NVCV_TEST_SUITE_P(OpReformat_Negative, test::ValueList<nvcv::ImageFormat, nvcv::ImageFormat, int, int>{
     // inFmt, outFmt, inputBatches, outputBatches
@@ -555,7 +742,7 @@ NVCV_TEST_SUITE_P(OpReformat_Negative, test::ValueList<nvcv::ImageFormat, nvcv::
     {nvcv::FMT_RGB8, nvcv::FMT_RGB8, 6, 3},
     {nvcv::FMT_RGB8p, nvcv::FMT_RGBf32, 1, 1},
     {nvcv::FMT_RGBf32, nvcv::FMT_RGB8p, 1, 1},
-    {nvcv::FMT_RGBf16, nvcv::FMT_RGBf16p, 1, 1}
+    {nvcv::FMT_RGBf16, nvcv::FMT_RGBf32p, 1, 1} // in/out dtype mismatch (F16 itself is valid)
 });
 
 // clang-format on
@@ -585,4 +772,117 @@ TEST_P(OpReformat_Negative, op)
 TEST(OpReformat_Negative, create_null_handle)
 {
     EXPECT_EQ(cvcudaReformatCreate(nullptr), NVCV_ERROR_INVALID_ARGUMENT);
+}
+
+TEST(OpReformat_Negative, rejects_mixed_width_tensor_dtype)
+{
+    const nvcv::DataType mixedWidth{nvcv::DataKind::UNSIGNED, static_cast<nvcv::Packing>(NVCV_PACKING_X32_Y24b8)};
+    nvcv::Tensor         inTensor(
+                {
+                    {1, 2, 5, 5},
+                    "NCHW"
+    },
+                mixedWidth);
+    nvcv::Tensor outTensor(
+        {
+            {1, 5, 5, 2},
+            "NHWC"
+    },
+        mixedWidth);
+
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+
+    cvcuda::Reformat op;
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT, nvcv::ProtectCall([&] { op(stream, inTensor, outTensor); }));
+
+    EXPECT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+    EXPECT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+TEST(OpReformat, element_type_dispatch_covers_supported_and_rejected_dtypes)
+{
+    const std::vector<nvcv::DataType> supportedTypes{nvcv::TYPE_S8, nvcv::TYPE_S16, nvcv::TYPE_S32, nvcv::TYPE_U16,
+                                                     nvcv::TYPE_F64};
+    const std::vector<nvcv::DataType> rejectedTypes{nvcv::DataType(nvcv::DataKind::FLOAT, nvcv::Packing::X8),
+                                                    nvcv::TYPE_S64, nvcv::TYPE_U32, nvcv::TYPE_C64,
+                                                    nvcv::DataType(nvcv::DataKind::UNSPECIFIED, nvcv::Packing::X8)};
+
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+    cvcuda::Reformat op;
+
+    auto runSupportedType = [&](int i)
+    {
+        SCOPED_TRACE(i);
+        const nvcv::DataType dtype = supportedTypes[i];
+        // Inverse layouts prevent the same-shape copy shortcut from bypassing element classification.
+        nvcv::Tensor         input(
+                    {
+                        {1, dtype.numChannels(), 5, 5},
+                        "NCHW"
+        },
+                    dtype);
+        nvcv::Tensor output(
+            {
+                {1, 5, 5, dtype.numChannels()},
+                "NHWC"
+        },
+            dtype);
+
+        EXPECT_NO_THROW(op(stream, input, output));
+    };
+
+    for (int i = 0; i < static_cast<int>(supportedTypes.size()); ++i)
+    {
+        runSupportedType(i);
+    }
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+
+    for (int i = 0; i < static_cast<int>(rejectedTypes.size()); ++i)
+    {
+        SCOPED_TRACE(i);
+        const nvcv::DataType dtype = rejectedTypes[i];
+        nvcv::Tensor         input(
+                    {
+                        {1, dtype.numChannels(), 5, 5},
+                        "NCHW"
+        },
+                    dtype);
+        nvcv::Tensor output(
+            {
+                {1, 5, 5, dtype.numChannels()},
+                "NHWC"
+        },
+            dtype);
+
+        EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT, nvcv::ProtectCall([&] { op(stream, input, output); }));
+    }
+
+    EXPECT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+}
+
+TEST(OpReformat, zero_sample_contiguous_c1_is_noop)
+{
+    nvcv::Tensor input(
+        {
+            {0, 1, 5, 37},
+            "NCHW"
+    },
+        nvcv::TYPE_U8);
+    nvcv::Tensor output(
+        {
+            {0, 5, 37, 1},
+            "NHWC"
+    },
+        nvcv::TYPE_U8);
+
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+
+    cvcuda::Reformat op;
+    EXPECT_NO_THROW(op(stream, input, output));
+
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
 }

@@ -68,7 +68,7 @@ CVCUDA_PUBLIC NVCVStatus cvcudaResizeCreate(NVCVOperatorHandle *handle);
  *       16bit Signed   | Yes
  *       32bit Unsigned | No
  *       32bit Signed   | No
- *       16bit Float    | No
+ *       16bit Float    | Yes
  *       32bit Float    | Yes
  *       64bit Float    | No
  *
@@ -84,7 +84,7 @@ CVCUDA_PUBLIC NVCVStatus cvcudaResizeCreate(NVCVOperatorHandle *handle);
  *       16bit Signed   | Yes
  *       32bit Unsigned | No
  *       32bit Signed   | No
- *       16bit Float    | No
+ *       16bit Float    | Yes
  *       32bit Float    | Yes
  *       64bit Float    | No
  *
@@ -98,6 +98,16 @@ CVCUDA_PUBLIC NVCVStatus cvcudaResizeCreate(NVCVOperatorHandle *handle);
  *       Channels      | Yes
  *       Width         | No
  *       Height        | No
+ *
+ *  Interpolation:
+ *
+ *       Method                    | Allowed
+ *       ------------------------- | -------------
+ *       NVCV_INTERP_NEAREST       | Yes
+ *       NVCV_INTERP_NEAREST_FLOOR | Yes
+ *       NVCV_INTERP_LINEAR        | Yes
+ *       NVCV_INTERP_CUBIC         | Yes
+ *       NVCV_INTERP_AREA          | Yes
  *
  * @param [in] handle Handle to the operator.
  *                    + Must not be NULL.

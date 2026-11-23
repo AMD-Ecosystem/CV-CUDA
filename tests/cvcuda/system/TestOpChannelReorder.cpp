@@ -238,6 +238,114 @@ TEST(OpChannelReorderVarShape, varshape_correct_output_rgba)
     RunChannelReorderOrdersGold(nvcv::FMT_RGBA8, {2, -1, 1, 3});
 }
 
+TEST(OpChannelReorderVarShape, varshape_planar_u8_unaligned_source_falls_back_to_scalar)
+{
+    constexpr int    kChannels   = 3;
+    constexpr int    kWidth      = 4;
+    constexpr int    kHeight     = 1;
+    constexpr size_t kPlaneBytes = static_cast<size_t>(kWidth) * kHeight;
+    constexpr size_t kImageBytes = kChannels * kPlaneBytes;
+
+    NVCVByte *srcAllocation = nullptr;
+    NVCVByte *dstAllocation = nullptr;
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&srcAllocation, kImageBytes + 1));
+    ASSERT_EQ(cudaSuccess, cudaMalloc(&dstAllocation, kImageBytes));
+    ASSERT_EQ(0u, reinterpret_cast<uintptr_t>(srcAllocation) & 3u);
+    ASSERT_EQ(0u, reinterpret_cast<uintptr_t>(dstAllocation) & 3u);
+
+    const std::array<uint8_t, kImageBytes> srcValues{1, 2, 3, 4, 11, 12, 13, 14, 21, 22, 23, 24};
+    const std::array<uint8_t, kImageBytes> expected{21, 22, 23, 24, 0, 0, 0, 0, 11, 12, 13, 14};
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(srcAllocation + 1, srcValues.data(), kImageBytes, cudaMemcpyHostToDevice));
+    ASSERT_EQ(cudaSuccess, cudaMemset(dstAllocation, 0xA5, kImageBytes));
+
+    auto wrapPlanarImage = [](NVCVByte *base)
+    {
+        nvcv::ImageDataStridedCuda::Buffer buffer{};
+        buffer.numPlanes = kChannels;
+        for (int plane = 0; plane < kChannels; ++plane)
+        {
+            buffer.planes[plane].width     = kWidth;
+            buffer.planes[plane].height    = kHeight;
+            buffer.planes[plane].rowStride = kWidth;
+            buffer.planes[plane].basePtr   = base + plane * kPlaneBytes;
+        }
+        return nvcv::ImageWrapData(nvcv::ImageDataStridedCuda{nvcv::FMT_RGB8p, buffer});
+    };
+
+    nvcv::Image              srcImage = wrapPlanarImage(srcAllocation + 1);
+    nvcv::Image              dstImage = wrapPlanarImage(dstAllocation);
+    nvcv::ImageBatchVarShape srcBatch(1);
+    nvcv::ImageBatchVarShape dstBatch(1);
+    srcBatch.pushBack(srcImage);
+    dstBatch.pushBack(dstImage);
+    nvcv::Tensor orders = MakeChannelReorderOrders(1, {2, -1, 1});
+
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+    cvcuda::ChannelReorder op;
+    EXPECT_NO_THROW(op(stream, srcBatch, dstBatch, orders));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+
+    std::array<uint8_t, kImageBytes> got{};
+    ASSERT_EQ(cudaSuccess, cudaMemcpy(got.data(), dstAllocation, kImageBytes, cudaMemcpyDeviceToHost));
+    EXPECT_EQ(expected, got);
+
+    ASSERT_EQ(cudaSuccess, cudaFree(srcAllocation));
+    ASSERT_EQ(cudaSuccess, cudaFree(dstAllocation));
+}
+
+TEST(OpChannelReorderVarShape, varshape_signed32_single_channel_correct_output)
+{
+    constexpr std::array<nvcv::Size2D, 2> sizes{
+        {{5, 3}, {3, 4}}
+    };
+
+    std::vector<nvcv::Image>          srcImages;
+    std::vector<nvcv::Image>          dstImages;
+    std::vector<std::vector<int32_t>> srcValues(sizes.size());
+    for (size_t image = 0; image < sizes.size(); ++image)
+    {
+        srcImages.emplace_back(sizes[image], nvcv::FMT_S32);
+        dstImages.emplace_back(sizes[image], nvcv::FMT_S32);
+
+        auto &values = srcValues[image];
+        values.resize(static_cast<size_t>(sizes[image].w) * sizes[image].h);
+        std::iota(values.begin(), values.end(), static_cast<int32_t>(image * 100 + 1));
+
+        auto srcData = srcImages.back().exportData<nvcv::ImageDataStridedCuda>();
+        ASSERT_TRUE(srcData);
+        const size_t rowBytes = static_cast<size_t>(sizes[image].w) * sizeof(int32_t);
+        ASSERT_EQ(cudaSuccess, cudaMemcpy2D(srcData->plane(0).basePtr, srcData->plane(0).rowStride, values.data(),
+                                            rowBytes, rowBytes, sizes[image].h, cudaMemcpyHostToDevice));
+    }
+
+    nvcv::ImageBatchVarShape srcBatch(sizes.size());
+    nvcv::ImageBatchVarShape dstBatch(sizes.size());
+    srcBatch.pushBack(srcImages.begin(), srcImages.end());
+    dstBatch.pushBack(dstImages.begin(), dstImages.end());
+    nvcv::Tensor orders = MakeChannelReorderOrders(static_cast<int>(sizes.size()), std::vector<int>{0});
+
+    cudaStream_t stream;
+    ASSERT_EQ(cudaSuccess, cudaStreamCreate(&stream));
+    cvcuda::ChannelReorder op;
+    EXPECT_NO_THROW(op(stream, srcBatch, dstBatch, orders));
+    ASSERT_EQ(cudaSuccess, cudaStreamSynchronize(stream));
+    ASSERT_EQ(cudaSuccess, cudaStreamDestroy(stream));
+
+    for (size_t image = 0; image < sizes.size(); ++image)
+    {
+        auto dstData = dstImages[image].exportData<nvcv::ImageDataStridedCuda>();
+        ASSERT_TRUE(dstData);
+        const size_t         rowBytes = static_cast<size_t>(sizes[image].w) * sizeof(int32_t);
+        std::vector<int32_t> got(srcValues[image].size());
+        ASSERT_EQ(cudaSuccess,
+                  cudaMemcpy2D(got.data(), rowBytes, dstData->plane(0).basePtr, dstData->plane(0).rowStride, rowBytes,
+                               sizes[image].h, cudaMemcpyDeviceToHost));
+        EXPECT_EQ(srcValues[image], got);
+    }
+}
+
 static nvcv::TensorShape MakeChannelReorderTensorShape(nvcv::TensorLayout layout, int numSamples, int width, int height,
                                                        int channels)
 {
@@ -386,6 +494,9 @@ TEST(OpChannelReorderTensor, correct_output_all_declared_types_layouts_channels)
     RunChannelReorderTensorCases<int16_t>(nvcv::TYPE_S16);
     RunChannelReorderTensorCases<int32_t>(nvcv::TYPE_S32);
     RunChannelReorderTensorCases<float>(nvcv::TYPE_F32);
+    // F16 routes through the 16-bit path (pure data movement, bit-exact); uint16_t host values
+    // double as F16 bit patterns for the memcmp comparison.
+    RunChannelReorderTensorCases<uint16_t>(nvcv::TYPE_F16);
 }
 
 TEST(OpChannelReorderTensor, preserves_float_bit_patterns)
@@ -446,6 +557,79 @@ TEST(OpChannelReorderTensor_Negative, invalid_order_and_alias_are_rejected)
     EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT,
               cvcudaChannelReorderSubmit(op.handle(), nullptr, src.handle(), src.handle(), valid.data(), 3));
     EXPECT_EQ(cudaSuccess, cudaDeviceSynchronize());
+}
+
+TEST(OpChannelReorderTensor_Negative, rejects_layout_shape_dtype_and_planar_channel_mismatches)
+{
+    cvcuda::ChannelReorder       op;
+    const std::array<int32_t, 3> order{2, 1, 0};
+
+    nvcv::Tensor invalidLayout(
+        {
+            {1, 5, 7, 3},
+            "ABCD"
+    },
+        nvcv::TYPE_U8);
+    nvcv::Tensor invalidLayoutOut(invalidLayout.shape(), invalidLayout.dtype());
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT,
+              nvcv::ProtectCall([&] { op(nullptr, invalidLayout, invalidLayoutOut, order.data(), 3); }));
+
+    nvcv::Tensor src(
+        {
+            {1, 5, 7, 3},
+            "NHWC"
+    },
+        nvcv::TYPE_U8);
+    nvcv::Tensor wrongShape(
+        {
+            {1, 5, 6, 3},
+            "NHWC"
+    },
+        nvcv::TYPE_U8);
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT, nvcv::ProtectCall([&] { op(nullptr, src, wrongShape, order.data(), 3); }));
+
+    nvcv::Tensor wrongDtype(src.shape(), nvcv::TYPE_S16);
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT, nvcv::ProtectCall([&] { op(nullptr, src, wrongDtype, order.data(), 3); }));
+
+    nvcv::Tensor unsupported(
+        {
+            {1, 5, 7, 3},
+            "NHWC"
+    },
+        nvcv::TYPE_U32);
+    nvcv::Tensor unsupportedOut(unsupported.shape(), unsupported.dtype());
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT,
+              nvcv::ProtectCall([&] { op(nullptr, unsupported, unsupportedOut, order.data(), 3); }));
+
+    nvcv::Tensor planarTwoChannel(
+        {
+            {1, 2, 5, 7},
+            "NCHW"
+    },
+        nvcv::TYPE_U8);
+    nvcv::Tensor                 planarTwoChannelOut(planarTwoChannel.shape(), planarTwoChannel.dtype());
+    const std::array<int32_t, 2> orderTwo{1, 0};
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT, nvcv::ProtectCall(
+                                               [&] {
+                                                   op(nullptr, planarTwoChannel, planarTwoChannelOut, orderTwo.data(),
+                                                      static_cast<int32_t>(orderTwo.size()));
+                                               }));
+}
+
+TEST(OpChannelReorderTensor, zero_height_returns_success_with_unchanged_metadata)
+{
+    nvcv::TensorShape shape{
+        {1, 0, 7, 3},
+        "NHWC"
+    };
+    nvcv::Tensor                 src(shape, nvcv::TYPE_U8);
+    nvcv::Tensor                 dst(shape, nvcv::TYPE_U8);
+    const std::array<int32_t, 3> order{2, 1, 0};
+
+    cvcuda::ChannelReorder op;
+    EXPECT_NO_THROW(op(nullptr, src, dst, order.data(), static_cast<int32_t>(order.size())));
+    EXPECT_EQ(shape, dst.shape());
+    EXPECT_EQ(nvcv::TYPE_U8, dst.dtype());
 }
 
 static void RunChannelReorderPlanarParityCase(nvcv::ImageFormat planarFmt, nvcv::ImageFormat interleavedFmt, int width,
@@ -612,13 +796,29 @@ TEST_F(TestOpChannelReorder, infer_void_samples)
 
 TEST_F(TestOpChannelReorder, infer_invalid_input_dataType)
 {
+    // 64-bit float stays outside the supported dtype set.
     input().pushBack(nvcv::Image{
         nvcv::Size2D{4, 2},
-        nvcv::FMT_RGBAf16
+        nvcv::FMT_F64
     });
     output().pushBack(nvcv::Image{
         nvcv::Size2D{4, 2},
-        nvcv::FMT_RGBA8
+        nvcv::FMT_F64
+    });
+
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT,
+              nvcv::ProtectCall([this] { channelReorder()(nullptr, input(), output(), orders()); }));
+}
+
+TEST_F(TestOpChannelReorder, infer_invalid_input_unsigned_32bit_dataType)
+{
+    input().pushBack(nvcv::Image{
+        nvcv::Size2D{4, 2},
+        nvcv::FMT_U32
+    });
+    output().pushBack(nvcv::Image{
+        nvcv::Size2D{4, 2},
+        nvcv::FMT_U32
     });
 
     EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT,
@@ -629,11 +829,11 @@ TEST_F(TestOpChannelReorder, infer_invalid_output_dataType)
 {
     input().pushBack(nvcv::Image{
         nvcv::Size2D{4, 2},
-        nvcv::FMT_RGBA8
+        nvcv::FMT_F32
     });
     output().pushBack(nvcv::Image{
         nvcv::Size2D{4, 2},
-        nvcv::FMT_RGBAf16
+        nvcv::FMT_F64
     });
 
     EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT,
@@ -750,6 +950,8 @@ NVCV_TEST_SUITE_P(OpChannelReorderPlanar,
     {31, 23, 1,   nvcv::FMT_RGBA8p,   nvcv::FMT_RGBA8},
     {35, 27, 2,  nvcv::FMT_RGBf32p,  nvcv::FMT_RGBf32},
     {33, 25, 1, nvcv::FMT_RGBAf32p, nvcv::FMT_RGBAf32},
+    {29, 21, 2,  nvcv::FMT_RGBf16p,  nvcv::FMT_RGBf16},
+    {27, 19, 1, nvcv::FMT_RGBAf16p, nvcv::FMT_RGBAf16},
 });
 
 // clang-format on
@@ -785,6 +987,29 @@ TEST_F(TestOpChannelReorder, infer_invalid_input_output_layout_mismatch_interlea
         nvcv::Size2D{4, 2},
         nvcv::FMT_BGRA8p
     });
+
+    EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT,
+              nvcv::ProtectCall([this] { channelReorder()(nullptr, input(), output(), orders()); }));
+}
+
+TEST_F(TestOpChannelReorder, infer_invalid_later_output_layout_family)
+{
+    pushDefaultImages();
+    input().pushBack(nvcv::Image{
+        nvcv::Size2D{4, 2},
+        nvcv::FMT_RGBA8
+    });
+    output().pushBack(nvcv::Image{
+        nvcv::Size2D{4, 2},
+        nvcv::FMT_RGBA8p
+    });
+
+    orders() = nvcv::Tensor(
+        {
+            {2, 4},
+            "NC"
+    },
+        nvcv::TYPE_S32);
 
     EXPECT_EQ(NVCV_ERROR_INVALID_ARGUMENT,
               nvcv::ProtectCall([this] { channelReorder()(nullptr, input(), output(), orders()); }));
