@@ -177,7 +177,12 @@ __global__ void NonMaximumSuppressionWarp(cuda::Tensor2DWrap<const T, int32_t>  
             }
         }
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+        // A 64-lane CDNA wavefront holds two candidates, so the vote stays within this lane's group.
+        if (cvcuda_hipAnyInGroup32(discard))
+#else
         if (__any_sync(0xffffffff, discard))
+#endif
         {
             discard = true;
             break;

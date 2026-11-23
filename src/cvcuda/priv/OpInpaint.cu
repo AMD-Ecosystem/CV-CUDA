@@ -732,7 +732,12 @@ __global__ void FillValueKernel(cuda::Tensor3DWrap<T, int32_t> dst, T value, int
 // Band-population reduction: the loop termination test
 // ---------------------------------------------------------------------------------------------
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+// The reduction already passes an explicit 32-lane width; ROCm only requires the mask to be 64-bit.
+constexpr unsigned long long kFinalMask = NVCV_WARP_FULL_MASK;
+#else
 constexpr unsigned int kFinalMask = 0xffffffff;
+#endif
 
 template<typename T>
 inline __device__ T WarpReduceSum(T val)

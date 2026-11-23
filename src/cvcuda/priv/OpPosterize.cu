@@ -324,7 +324,13 @@ struct PosterizeStreamCarrier<BT, std::enable_if_t<cuda::detail::IsHalfV<BT>>>
         for (int i = 0; i < 4; ++i)
         {
             const uint32_t word = cuda::GetElement(v, i);
-            const __half2  pair{
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+            // HIP lacks __heq2_mask and __hmax2_nan; the scalar half path computes the same values.
+            const __half lo = PosterizeValue<BT>(__ushort_as_half(static_cast<uint16_t>(word)), param.scalar);
+            const __half hi = PosterizeValue<BT>(__ushort_as_half(static_cast<uint16_t>(word >> 16)), param.scalar);
+            cuda::GetElement(v, i) = __half_as_ushort(lo) | (static_cast<uint32_t>(__half_as_ushort(hi)) << 16);
+#else
+            const __half2 pair{
                 __half2_raw{static_cast<uint16_t>(word), static_cast<uint16_t>(word >> 16)}
             };
             const __half2  zero         = __float2half2_rn(0.f);
@@ -334,6 +340,7 @@ struct PosterizeStreamCarrier<BT, std::enable_if_t<cuda::detail::IsHalfV<BT>>>
             const __half2_raw quantized = __hmul2(q, param.reciprocal);
             // min/max choose positive zero; retain an input negative zero as the scalar path does.
             cuda::GetElement(v, i) = quantized.x | (static_cast<uint32_t>(quantized.y) << 16) | zeroSigns;
+#endif
         }
         return v;
     }
@@ -352,29 +359,35 @@ __global__ void PosterizePlanarVarShapePacked(cuda::ImageBatchVarShapeWrap<const
                                               cuda::ImageBatchVarShapeWrap<unsigned char> dst, int numPlanes,
                                               uint32_t maskWord)
 {
-    const int              g0        = blockIdx.x * blockDim.x * NGroups + threadIdx.x;
-    const int              y         = blockIdx.y * blockDim.y + threadIdx.y;
-    const int              nc        = blockIdx.z;
-    const int              batch     = nc / numPlanes;
-    const int              channel   = nc % numPlanes;
+    const int g0      = blockIdx.x * blockDim.x * NGroups + threadIdx.x;
+    const int y       = blockIdx.y * blockDim.y + threadIdx.y;
+    const int nc      = blockIdx.z;
+    const int batch   = nc / numPlanes;
+    const int channel = nc % numPlanes;
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+    // Each 32-thread row of the block broadcasts from its own first lane; the explicit shuffle
+    // width keeps the two rows of a 64-lane CDNA wavefront apart. ROCm requires a 64-bit mask.
+    constexpr unsigned long long kFullWarp = NVCV_WARP_FULL_MASK;
+#else
     constexpr unsigned int kFullWarp = 0xffffffffu;
-    const bool             leader    = threadIdx.x == 0;
-    NVCVImagePlaneStrided  srcPlane{};
-    NVCVImagePlaneStrided  dstPlane{};
+#endif
+    const bool            leader = threadIdx.x == 0;
+    NVCVImagePlaneStrided srcPlane{};
+    NVCVImagePlaneStrided dstPlane{};
     if (leader)
     {
         srcPlane = src.plane(batch, channel);
         dstPlane = dst.plane(batch, channel);
     }
 
-    const int       width     = __shfl_sync(kFullWarp, dstPlane.width, 0);
-    const int       height    = __shfl_sync(kFullWarp, dstPlane.height, 0);
-    const int       srcStride = __shfl_sync(kFullWarp, srcPlane.rowStride, 0);
-    const int       dstStride = __shfl_sync(kFullWarp, dstPlane.rowStride, 0);
+    const int       width     = __shfl_sync(kFullWarp, dstPlane.width, 0, 32);
+    const int       height    = __shfl_sync(kFullWarp, dstPlane.height, 0, 32);
+    const int       srcStride = __shfl_sync(kFullWarp, srcPlane.rowStride, 0, 32);
+    const int       dstStride = __shfl_sync(kFullWarp, dstPlane.rowStride, 0, 32);
     const uintptr_t srcBase
-        = __shfl_sync(kFullWarp, leader ? reinterpret_cast<uintptr_t>(srcPlane.basePtr) : uintptr_t{0}, 0);
+        = __shfl_sync(kFullWarp, leader ? reinterpret_cast<uintptr_t>(srcPlane.basePtr) : uintptr_t{0}, 0, 32);
     const uintptr_t dstBase
-        = __shfl_sync(kFullWarp, leader ? reinterpret_cast<uintptr_t>(dstPlane.basePtr) : uintptr_t{0}, 0);
+        = __shfl_sync(kFullWarp, leader ? reinterpret_cast<uintptr_t>(dstPlane.basePtr) : uintptr_t{0}, 0, 32);
 
     if (g0 * 4 >= width || y >= height)
     {

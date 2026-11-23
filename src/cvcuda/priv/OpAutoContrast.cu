@@ -195,6 +195,10 @@ static __device__ __noinline__ float RemapWideFloat(float in, float lo, float hi
 // path is unnecessary, including for zero numerators. Keep its RN correction.
 inline __device__ float DivideS16Range(float numerator, float range)
 {
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+    // The sequence below computes the correctly rounded quotient; HIP has that as one call.
+    return __fdiv_rn(numerator, range);
+#else
     float reciprocal;
     asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(reciprocal) : "f"(range));
     const float error     = __fmaf_rn(-range, reciprocal, 1.f);
@@ -202,6 +206,7 @@ inline __device__ float DivideS16Range(float numerator, float range)
     const float quotient  = __fmaf_rn(numerator, reciprocal, 0.f);
     const float remainder = __fmaf_rn(-range, quotient, numerator);
     return __fmaf_rn(reciprocal, remainder, quotient);
+#endif
 }
 
 // AutoContrast remap, shared by every layout/container. A flat channel passes
@@ -868,8 +873,8 @@ __global__ __launch_bounds__(kF32C3FullBlock) void ApplyF32C3FullStream(const fl
 #pragma unroll
     for (int c = 0; c < 3; ++c)
     {
-        loV[c] = __shfl_sync(0xffffffffu, laneLo, c);
-        hiV[c] = __shfl_sync(0xffffffffu, laneHi, c);
+        loV[c] = __shfl_sync(NVCV_SHFL_MASK, laneLo, c, WARP_WIDTH);
+        hiV[c] = __shfl_sync(NVCV_SHFL_MASK, laneHi, c, WARP_WIDTH);
     }
 
     bool allNormal = true;

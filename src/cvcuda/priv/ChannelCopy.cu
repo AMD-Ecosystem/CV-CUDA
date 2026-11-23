@@ -18,6 +18,15 @@
 namespace cvcuda::priv {
 namespace {
 
+// The warp kernels below partition each block into 32-lane groups (lane = threadIdx.x % 32),
+// so their shuffles pass an explicit width of 32 to stay within the group on a 64-lane CDNA
+// wavefront. The mask only marks participants and must be 64-bit on ROCm.
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+#    define NVCV_SHFL_MASK NVCV_WARP_FULL_MASK
+#else
+#    define NVCV_SHFL_MASK 0xffffffff
+#endif
+
 struct ChannelTensor
 {
     unsigned char *base;
@@ -227,9 +236,9 @@ __device__ __forceinline__ void MergeWarp3Row(const uint8_t *band0, const uint8_
             const int      index      = phase * 32 + lane;
             const int      sourceLane = index / 3 % 32;
             const int      pattern    = index % 3;
-            const uint32_t value0     = __shfl_sync(0xffffffff, first[phase / 3], sourceLane);
-            const uint32_t value1     = __shfl_sync(0xffffffff, second[phase / 3], sourceLane);
-            const uint32_t value2     = __shfl_sync(0xffffffff, third[phase / 3], sourceLane);
+            const uint32_t value0     = __shfl_sync(NVCV_SHFL_MASK, first[phase / 3], sourceLane, 32);
+            const uint32_t value1     = __shfl_sync(NVCV_SHFL_MASK, second[phase / 3], sourceLane, 32);
+            const uint32_t value2     = __shfl_sync(NVCV_SHFL_MASK, third[phase / 3], sourceLane, 32);
             const uint32_t selector0  = pattern == 0 ? 0x5140 : (pattern == 1 ? 0x0625 : 0x0073);
             const uint32_t selector1  = pattern == 0 ? 0x2410 : (pattern == 1 ? 0x2150 : 0x7106);
             out[(tile * WordsPerLane * 3 + phase) * 32 + lane]
@@ -473,10 +482,10 @@ __device__ __forceinline__ void CopyInterleavedRow(unsigned char *image, unsigne
                 Bits value;
                 if constexpr (sizeof(Bits) == 8)
                     value = static_cast<Bits>(
-                        __shfl_sync(0xffffffff, static_cast<unsigned long long>(values[channel]), sourceLane));
+                        __shfl_sync(NVCV_SHFL_MASK, static_cast<unsigned long long>(values[channel]), sourceLane, 32));
                 else
                     value = static_cast<Bits>(
-                        __shfl_sync(0xffffffff, static_cast<unsigned int>(values[channel]), sourceLane));
+                        __shfl_sync(NVCV_SHFL_MASK, static_cast<unsigned int>(values[channel]), sourceLane, 32));
                 if (sourceChannel == channel)
                     selected = value;
             }
