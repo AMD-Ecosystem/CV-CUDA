@@ -384,7 +384,7 @@ All boolean options accept both numeric (``0``/``1``) and CMake boolean values (
     build.sh release build-rel "-DCVCUDA_AARCH64_JETSON=ON"
 
     # Build for AMD GPUs with HIP/ROCm
-    ci/build.sh release build-rel -DUSE_HIP=1 -DCMAKE_HIP_ARCHITECTURES=gfx90a -DCMAKE_PREFIX_PATH=/opt/rocm
+    build.sh release build-rel -DUSE_HIP=1 -DCMAKE_HIP_ARCHITECTURES=gfx90a -DCMAKE_PREFIX_PATH=/opt/rocm -DBUILD_PYTHON=0
 
 .. _build-rocm:
 
@@ -402,9 +402,11 @@ Build with HIP enabled, selecting the target AMD architecture:
 
 .. code-block:: shell
 
-    ci/build.sh release build-rel -DUSE_HIP=1 -DCMAKE_HIP_ARCHITECTURES=gfx90a -DCMAKE_PREFIX_PATH=/opt/rocm
+    build.sh release build-rel -DUSE_HIP=1 -DCMAKE_HIP_ARCHITECTURES=gfx90a -DCMAKE_PREFIX_PATH=/opt/rocm -DBUILD_PYTHON=0
 
 If ROCm is not on your ``PATH``, pass ``-DCMAKE_PREFIX_PATH=/opt/rocm`` so CMake finds the hip* packages (``find_package(hip)`` and friends).
+
+The ROCm build covers the C++ libraries and their C++ tests; the Python bindings are not built for AMD GPUs yet, hence ``-DBUILD_PYTHON=0``.
 
 When ``CMAKE_HIP_ARCHITECTURES`` is left unset the build detects the architecture of the GPU(s) in the build host, and fails if it finds none; set it explicitly to build for another target (for example ``gfx1100`` for RDNA3 desktop cards). No source or CMake edits are needed to retarget. The build outputs the same library and test layout as the CUDA build, and the test suites run unchanged on the AMD GPU.
 
