@@ -27,9 +27,9 @@ namespace cuda  = nvcv::cuda;
 namespace ttype = nvcv::test::type;
 
 template<typename T>
-constexpr T min = std::numeric_limits<T>::min();
+constexpr T minValue = std::numeric_limits<T>::min();
 template<typename T>
-constexpr T max = std::numeric_limits<T>::max();
+constexpr T maxValue = std::numeric_limits<T>::max();
 
 using schar = signed char;
 
@@ -55,34 +55,34 @@ NVCV_TYPED_TEST_SUITE(
     ttype::Types<double, ttype::Value<int2{-1234, 1234}>, ttype::Value<double2{-1234.0, 1234.0}>>,
     // float -> int: powers of two just outside the range must return integer bounds directly.
     ttype::Types<long long, ttype::Value<double2{0x1p63, 0x1.fffffffffffffp62}>,
-                 ttype::Value<longlong2{max<long long>, max<long long> - 1023}>>,
+                 ttype::Value<longlong2{maxValue<long long>, maxValue<long long> - 1023}>>,
     ttype::Types<long long, ttype::Value<double2{-0x1p63, 0x1p64}>,
-                 ttype::Value<longlong2{min<long long>, max<long long>}>>,
+                 ttype::Value<longlong2{minValue<long long>, maxValue<long long>}>>,
     ttype::Types<unsigned long long, ttype::Value<double3{0x1p64, 0x1.fffffffffffffp63, -1.0}>,
-                 ttype::Value<ulonglong3{max<unsigned long long>, max<unsigned long long> - 2047, 0}>>,
-    ttype::Types<int, ttype::Value<float2{0x1p31f, -0x1p31f}>, ttype::Value<int2{max<int>, min<int>}>>,
-    ttype::Types<signed char, ttype::Value<float2{-345.67f, 456.78f}>, ttype::Value<char2{min<signed char>, max<signed char>}>>,
+                 ttype::Value<ulonglong3{maxValue<unsigned long long>, maxValue<unsigned long long> - 2047, 0}>>,
+    ttype::Types<int, ttype::Value<float2{0x1p31f, -0x1p31f}>, ttype::Value<int2{maxValue<int>, minValue<int>}>>,
+    ttype::Types<signed char, ttype::Value<float2{-345.67f, 456.78f}>, ttype::Value<char2{minValue<signed char>, maxValue<signed char>}>>,
     ttype::Types<unsigned short, ttype::Value<float2{-0.1f, 1.6f}>, ttype::Value<ushort2{0, 2}>>,
     ttype::Types<int2, ttype::Value<float2{-1.1f, 0.6f}>, ttype::Value<int2{-1, 1}>>,
     ttype::Types<unsigned int, ttype::Value<float2{-3.3f, 1.4f}>, ttype::Value<uint2{0, 1}>>,
-    ttype::Types<unsigned char, ttype::Value<double2{-0.3, 256.1}>, ttype::Value<uchar2{0, max<unsigned char>}>>,
-    ttype::Types<signed char, ttype::Value<double2{-0.7, 345.67}>, ttype::Value<char2{-1, max<signed char>}>>,
-    ttype::Types<short2, ttype::Value<double2{-1.4, 1234567.8}>, ttype::Value<short2{-1, max<short>}>>,
+    ttype::Types<unsigned char, ttype::Value<double2{-0.3, 256.1}>, ttype::Value<uchar2{0, maxValue<unsigned char>}>>,
+    ttype::Types<signed char, ttype::Value<double2{-0.7, 345.67}>, ttype::Value<char2{-1, maxValue<signed char>}>>,
+    ttype::Types<short2, ttype::Value<double2{-1.4, 1234567.8}>, ttype::Value<short2{-1, maxValue<short>}>>,
     // int -> int, from small to big and equal
     ttype::Types<short1, ttype::Value<char1{123}>, ttype::Value<short1{123}>>,
-    ttype::Types<unsigned long long, ttype::Value<ulong2{0, max<unsigned long>}>, ttype::Value<ulonglong2{0, max<unsigned long>}>>,
+    ttype::Types<unsigned long long, ttype::Value<ulong2{0, maxValue<unsigned long>}>, ttype::Value<ulonglong2{0, maxValue<unsigned long>}>>,
     ttype::Types<long long, ttype::Value<long2{-1234567, 1234567}>, ttype::Value<longlong2{-1234567, 1234567}>>,
     ttype::Types<unsigned short, ttype::Value<char3{-128, 0, 127}>, ttype::Value<ushort3{0, 0, 127}>>,
     ttype::Types<short2, ttype::Value<uchar2{0, 255}>, ttype::Value<short2{0, 255}>>,
     ttype::Types<unsigned char, ttype::Value<char4{-128, -127, 0, 127}>, ttype::Value<uchar4{0, 0, 0, 127}>>,
-    ttype::Types<signed char, ttype::Value<uchar3{0, 1, 255}>, ttype::Value<char3{0, 1, max<signed char>}>>,
+    ttype::Types<signed char, ttype::Value<uchar3{0, 1, 255}>, ttype::Value<char3{0, 1, maxValue<signed char>}>>,
     // int -> int, from big to small
-    ttype::Types<short1, ttype::Value<int1{1234567}>, ttype::Value<short1{max<short>}>>,
-    ttype::Types<short2, ttype::Value<uint2{0, 1234567}>, ttype::Value<short2{0, max<short>}>>,
-    ttype::Types<unsigned short, ttype::Value<int3{-1234, 0, 1234567}>, ttype::Value<ushort3{0, 0, max<unsigned short>}>>,
-    ttype::Types<unsigned char, ttype::Value<int2{-1234, 1234}>, ttype::Value<uchar2{0, max<unsigned char>}>>,
-    ttype::Types<signed char, ttype::Value<uint2{0, 1234567}>, ttype::Value<char2{0, max<signed char>}>>,
-    ttype::Types<unsigned char, ttype::Value<ulonglong2{0, 123456789}>, ttype::Value<uchar2{0, max<unsigned char>}>>,
+    ttype::Types<short1, ttype::Value<int1{1234567}>, ttype::Value<short1{maxValue<short>}>>,
+    ttype::Types<short2, ttype::Value<uint2{0, 1234567}>, ttype::Value<short2{0, maxValue<short>}>>,
+    ttype::Types<unsigned short, ttype::Value<int3{-1234, 0, 1234567}>, ttype::Value<ushort3{0, 0, maxValue<unsigned short>}>>,
+    ttype::Types<unsigned char, ttype::Value<int2{-1234, 1234}>, ttype::Value<uchar2{0, maxValue<unsigned char>}>>,
+    ttype::Types<signed char, ttype::Value<uint2{0, 1234567}>, ttype::Value<char2{0, maxValue<signed char>}>>,
+    ttype::Types<unsigned char, ttype::Value<ulonglong2{0, 123456789}>, ttype::Value<uchar2{0, maxValue<unsigned char>}>>,
     ttype::Types<signed char, ttype::Value<long2{-1234567, 1234567}>, ttype::Value<char2{-128, 127}>>
     >);
 

@@ -222,7 +222,11 @@ static std::vector<uint16_t> GenerateRandomInputF16(
 
 static float F16BitsToFloat(uint16_t bits)
 {
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+    return __half2float(__ushort_as_half(bits)); // HIP's __half_raw leads with a _Float16 member
+#else
     return __half2float(__half(__half_raw{bits}));
+#endif
 }
 
 // Element-based BORDER_REPLICATE expansion by ksize/2 on each side (the F16 counterpart of

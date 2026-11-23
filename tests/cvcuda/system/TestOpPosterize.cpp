@@ -674,7 +674,11 @@ std::vector<T> PosterizeFloatInputs(int bits)
             for (uint16_t neighbor :
                  {static_cast<uint16_t>(raw == 0 ? 0x8001 : raw - 1), raw, static_cast<uint16_t>(raw + 1)})
             {
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+                values.push_back(__ushort_as_half(neighbor)); // HIP's __half_raw leads with a _Float16 member
+#else
                 values.push_back(__half{__half_raw{neighbor}});
+#endif
             }
         }
         else
@@ -905,7 +909,11 @@ TEST(OpPosterize, exhaustive_half_quantization)
     std::vector<__half> input(count);
     for (int i = 0; i < count; ++i)
     {
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+        input[i] = __ushort_as_half(static_cast<uint16_t>(i)); // HIP's __half_raw leads with a _Float16 member
+#else
         input[i] = __half{__half_raw{static_cast<uint16_t>(i)}};
+#endif
     }
     auto src     = nvcv::util::CreateTensor(1, 256, 256, nvcv::FMT_F16);
     auto dst     = nvcv::util::CreateTensor(1, 256, 256, nvcv::FMT_F16);

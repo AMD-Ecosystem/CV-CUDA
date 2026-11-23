@@ -165,7 +165,9 @@ TEST_P(OpFindHomography, correct_output)
     // Fill gold models and src and dst points
     for (int i = 0; i < numSamples; i++)
     {
-#pragma unroll
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(USE_HIP) // clang rejects unroll on a non-loop
+#    pragma unroll
+#endif
         calculateGoldModelMatrix(&modelsVec[i * 9], gen, dis);
         // generate src and dst points
         for (int j = 0; j < numYPoints; j++)

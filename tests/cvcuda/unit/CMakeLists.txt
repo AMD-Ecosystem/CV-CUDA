@@ -34,10 +34,11 @@ set(CVCUDA_TEST_UNIT_SOURCES
     TestTextBackend.cpp
 )
 
-# The box blur operator and the on-screen display text backend are not built for
-# ROCm, so their unit tests are left out of that build.
+# The on-screen display drawing operators (OSD, bounding box, box blur) and their
+# text backend are not built for ROCm, so their unit tests are left out of that
+# build.
 if(USE_HIP)
-    list(FILTER CVCUDA_TEST_UNIT_SOURCES EXCLUDE REGEX "TestOpBoxBlur|TestTextBackend")
+    list(FILTER CVCUDA_TEST_UNIT_SOURCES EXCLUDE REGEX "TestOpBndBox|TestOpBoxBlur|TestTextBackend")
 endif()
 
 add_executable(cvcuda_test_unit ${CVCUDA_TEST_UNIT_SOURCES})

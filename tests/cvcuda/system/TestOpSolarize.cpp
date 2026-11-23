@@ -408,7 +408,12 @@ TEST(OpSolarize, exhaustive_half_thresholds)
     {
         SCOPED_TRACE(format);
         std::vector<__half> input(count * format.numChannels());
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+        // HIP's __half_raw leads with a _Float16 member, so build the half from its bits directly.
+        for (size_t i = 0; i < input.size(); ++i) input[i] = __ushort_as_half(static_cast<uint16_t>(i));
+#else
         for (size_t i = 0; i < input.size(); ++i) input[i] = __half{__half_raw{static_cast<uint16_t>(i)}};
+#endif
         auto src     = nvcv::util::CreateTensor(1, 256, 256, format);
         auto dst     = nvcv::util::CreateTensor(1, 256, 256, format);
         auto srcData = src.exportData<nvcv::TensorDataStridedCuda>();

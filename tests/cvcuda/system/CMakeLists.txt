@@ -111,7 +111,7 @@ set(CVCUDA_TEST_SOURCES_CPP20
 # The OSD, bounding box, and box blur operators are not built for ROCm, so their
 # tests and the smoke tests that exercise them are left out of that build.
 if(USE_HIP)
-    list(FILTER CVCUDA_TEST_SOURCES EXCLUDE REGEX "TestOpOSD|TestOpBndBox|TestOpBoxBlur")
+    list(FILTER CVCUDA_TEST_SOURCES EXCLUDE REGEX "TestOpOSD|TestOsdMemory|TestOpBndBox|TestOpBoxBlur")
 endif()
 
 if(NOT USE_HIP)
@@ -130,6 +130,16 @@ endif()
 # Include C++20-requiring tests only if compiler supports them
 if(NOT (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 11.0))
     list(APPEND CVCUDA_TEST_SOURCES ${CVCUDA_TEST_SOURCES_CPP20})
+endif()
+
+if(USE_HIP)
+    # HIP provides the full host-side __half API (integer constructors, bit casts,
+    # arithmetic) only under the HIP compiler; a plain C++ compiler gets a reduced
+    # fallback. These tests use __half on the host, so their C++ sources are
+    # compiled as HIP.
+    set(_hip_test_cpp_sources ${CVCUDA_TEST_SOURCES})
+    list(FILTER _hip_test_cpp_sources INCLUDE REGEX "\\.cpp$")
+    set_source_files_properties(${_hip_test_cpp_sources} PROPERTIES LANGUAGE HIP)
 endif()
 
 add_executable(cvcuda_test_system ${CVCUDA_TEST_SOURCES})

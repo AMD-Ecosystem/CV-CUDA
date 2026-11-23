@@ -23,9 +23,9 @@ namespace cuda  = nvcv::cuda;
 namespace ttype = nvcv::test::type;
 
 template<typename T>
-constexpr T min = std::numeric_limits<T>::min();
+constexpr T minValue = std::numeric_limits<T>::min();
 template<typename T>
-constexpr T max = std::numeric_limits<T>::max();
+constexpr T maxValue = std::numeric_limits<T>::max();
 
 // ------------------------ Testing IsSameCompound -----------------------------
 
@@ -184,8 +184,8 @@ NVCV_TYPED_TEST_SUITE(
     MathOpsUnaryBitwiseNOTTest, ttype::Types<
     ttype::Types<ttype::Value<ushort1{0}>, ttype::Value<int1{-1}>>,
     ttype::Types<ttype::Value<uchar2{0, 0xFF}>, ttype::Value<int2{-1, static_cast<int>(0xFFFFFF00)}>>,
-    ttype::Types<ttype::Value<uint3{0x77778888, 0, 0x88887777}>, ttype::Value<uint3{0x88887777, max<unsigned int>, 0x77778888}>>,
-    ttype::Types<ttype::Value<long4_16a{0, 1, 2, max<long>}>, ttype::Value<long4_16a{-1, -2, -3, min<long>}>>
+    ttype::Types<ttype::Value<uint3{0x77778888, 0, 0x88887777}>, ttype::Value<uint3{0x88887777, maxValue<unsigned int>, 0x77778888}>>,
+    ttype::Types<ttype::Value<long4_16a{0, 1, 2, maxValue<long>}>, ttype::Value<long4_16a{-1, -2, -3, minValue<long>}>>
 >);
 
 // clang-format on

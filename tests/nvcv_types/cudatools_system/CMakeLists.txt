@@ -62,6 +62,14 @@ else()
     message(WARNING "GCC-${CMAKE_CXX_COMPILER_VERSION}: Excluding cudatools tests requiring C++20 NTTP features. Build with GCC-11+ for full test coverage.")
 endif()
 
+if(USE_HIP)
+    # HIP provides the full host-side __half API (integer constructors, bit casts,
+    # arithmetic) only under the HIP compiler; a plain C++ compiler gets a reduced
+    # fallback. These tests use __half on the host, so they are compiled as HIP.
+    set_source_files_properties(TestMathOps.cpp TestMathWrappers.cpp TestSaturateCast.cpp TestStaticCast.cpp
+        PROPERTIES LANGUAGE HIP)
+endif()
+
 add_executable(nvcv_test_cudatools_system ${CUDATOOLS_TEST_SOURCES})
 
 target_link_libraries(nvcv_test_cudatools_system
