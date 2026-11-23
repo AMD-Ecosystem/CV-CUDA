@@ -270,7 +270,11 @@ __device__ void PadAndStackRow(SrcWrapper src, T *dstRow, int dstWidth, int sy, 
             {
                 const auto   border = src.borderValue();
                 unsigned int bits   = 0;
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+                __builtin_memcpy(&bits, &border, sizeof(T)); // std::memcpy is host-only under HIP
+#else
                 std::memcpy(&bits, &border, sizeof(T));
+#endif
                 if constexpr (sizeof(T) == 1)
                     bits *= 0x01010101u;
                 *reinterpret_cast<Pack *>(dstRow + x) = cuda::SetAll<Pack>(bits);

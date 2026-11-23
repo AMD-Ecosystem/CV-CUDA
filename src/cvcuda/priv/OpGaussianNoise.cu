@@ -100,7 +100,11 @@ __device__ __forceinline__ void GaussianNoiseAdvanceNormalState(unsigned long lo
     // curand's Box-Muller path caches one normal sample; consume it before
     // skipahead so localState.boxmuller_flag / EXTRA_FLAG_NORMAL advancement
     // stays deterministic. Re-check this if curand_normal internals change.
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+    if (cvcuda_hipHasCachedNormal(localState))
+#else
     if (localState.boxmuller_flag == EXTRA_FLAG_NORMAL)
+#endif
     {
         (void)curand_normal(&localState);
         if (--normalCount == 0)
@@ -185,7 +189,11 @@ inline void LaunchSegmented(int batch, int segments, curandState *states, curand
 
 __device__ __forceinline__ float2 GaussianNoiseNormal2(curandState &localState)
 {
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+    if (cvcuda_hipHasCachedNormal(localState))
+#else
     if (localState.boxmuller_flag == EXTRA_FLAG_NORMAL)
+#endif
     {
         return {curand_normal(&localState), curand_normal(&localState)};
     }

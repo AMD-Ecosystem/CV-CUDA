@@ -23,7 +23,9 @@
 
 #include "ElementStreamCommon.cuh"
 
-#include <cudaTypedefs.h>
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(USE_HIP)
+#    include <cudaTypedefs.h>
+#endif
 #include <cuda_runtime.h>
 #include <cvcuda/OpNormalize.h> // for CVCUDA_NORMALIZE_SCALE_IS_STDDEV
 #include <cvcuda/cuda_tools/DropCast.hpp>
@@ -499,19 +501,23 @@ bool IsCurrentDeviceL4NameOnly(); // Avoid a missing-declarations warning in nvc
 // Query only the name: a per-submission bulk properties query is costly on the measured L4 host.
 bool IsCurrentDeviceL4NameOnly()
 {
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+    // The query asks the CUDA driver for an NVIDIA product name; no AMD GPU is an L4.
+    return false;
+#else
     int device;
     NVCV_CHECK_THROW(cudaGetDevice(&device));
     void                           *getDeviceEntry = nullptr, *getNameEntry = nullptr;
     cudaDriverEntryPointQueryResult deviceStatus, nameStatus;
-#if CUDART_VERSION >= 13000
+#    if CUDART_VERSION >= 13000
     NVCV_CHECK_THROW(
         cudaGetDriverEntryPointByVersion("cuDeviceGet", &getDeviceEntry, 2000, cudaEnableDefault, &deviceStatus));
     NVCV_CHECK_THROW(
         cudaGetDriverEntryPointByVersion("cuDeviceGetName", &getNameEntry, 2000, cudaEnableDefault, &nameStatus));
-#else
+#    else
     NVCV_CHECK_THROW(cudaGetDriverEntryPoint("cuDeviceGet", &getDeviceEntry, cudaEnableDefault, &deviceStatus));
     NVCV_CHECK_THROW(cudaGetDriverEntryPoint("cuDeviceGetName", &getNameEntry, cudaEnableDefault, &nameStatus));
-#endif
+#    endif
     if (deviceStatus != cudaDriverEntryPointSuccess || nameStatus != cudaDriverEntryPointSuccess
         || getDeviceEntry == nullptr || getNameEntry == nullptr)
     {
@@ -525,6 +531,7 @@ bool IsCurrentDeviceL4NameOnly()
         throw nvcv::Exception(nvcv::Status::ERROR_INTERNAL, "CUDA device identity query failed");
     }
     return std::strcmp(name, "NVIDIA L4") == 0;
+#endif
 }
 
 struct PlanarConstParamWrap;

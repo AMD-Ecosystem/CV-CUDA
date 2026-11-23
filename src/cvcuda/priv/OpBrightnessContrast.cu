@@ -215,7 +215,11 @@ __device__ __forceinline__ long long BrightnessContrastToS64(double v)
 {
     unsigned long long bits;
     // An opaque bitcast keeps NVCC from lowering the magnitude mask to FP64 abs.
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+    bits = static_cast<unsigned long long>(__double_as_longlong(v));
+#else
     asm("mov.b64 %0, %1;" : "=l"(bits) : "d"(v));
+#endif
     const unsigned long long magnitude = bits & 0x7fffffffffffffffULL;
     if (magnitude >= 0x43e0000000000000ULL)
     {
@@ -251,9 +255,9 @@ inline __device__ DstT ApplyBrightnessContrast(SrcT v, const SampleArgs<ArgT, Is
     // device-side decltype (clang rejects host fns in __device__ unevaluated ctx).
     using IntermediateT = decltype(nvcv::cuda::compat::declval<ArgT>() * nvcv::cuda::compat::declval<SrcT>());
 #else
-    using IntermediateT = decltype(std::declval<ArgT>() * std::declval<SrcT>());
+    using IntermediateT           = decltype(std::declval<ArgT>() * std::declval<SrcT>());
 #endif
-    using BI            = cuda::BaseType<IntermediateT>;
+    using BI = cuda::BaseType<IntermediateT>;
     IntermediateT pixel;
     if constexpr (std::is_same_v<cuda::BaseType<SrcT>, long long>)
     {
@@ -325,14 +329,14 @@ template<bool IsPlanar, class SrcWrapper, class DstWrapper, typename ArgT, bool 
 inline __device__ void DoBrightnessContrast(SrcWrapper src, DstWrapper dst, const SampleArgs<ArgT, IsScalar> arg,
                                             const int2 size, const int p)
 {
-    using SrcT                       = std::remove_const_t<typename SrcWrapper::ValueType>;
-    using DstT                       = typename DstWrapper::ValueType;
+    using SrcT = std::remove_const_t<typename SrcWrapper::ValueType>;
+    using DstT = typename DstWrapper::ValueType;
 #if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
     // std::declval is __host__-only; use the __host__ __device__ shim in this
     // device-side decltype (clang rejects host fns in __device__ unevaluated ctx).
     using IntermediateT = decltype(nvcv::cuda::compat::declval<ArgT>() * nvcv::cuda::compat::declval<SrcT>());
 #else
-    using IntermediateT              = decltype(std::declval<ArgT>() * std::declval<SrcT>());
+    using IntermediateT           = decltype(std::declval<ArgT>() * std::declval<SrcT>());
 #endif
     using SrcBT                      = cuda::BaseType<SrcT>;
     using DstBT                      = cuda::BaseType<DstT>;
@@ -451,7 +455,11 @@ __global__ void BrightnessContrastStream(const SrcBT *__restrict__ src, DstBT *_
             if (full[g])
             {
 #pragma unroll
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+                for (int k = 0; k < N; ++k) raw[g][k] = static_cast<unsigned long long>(__double_as_longlong(in[g][k]));
+#else
                 for (int k = 0; k < N; ++k) asm("mov.b64 %0, %1;" : "=l"(raw[g][k]) : "d"(in[g][k]));
+#endif
             }
         }
         const auto key0  = __shfl_sync(mask, raw[0][0], 0);

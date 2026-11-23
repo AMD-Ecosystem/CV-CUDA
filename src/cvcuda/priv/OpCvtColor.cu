@@ -1704,6 +1704,7 @@ inline void Launch_BGR_to_YUV(const nvcv::TensorDataStridedCuda &inData, const n
     int2 dstSize{shape.W, shape.H};
 
     bool wide = NeedsWideStrides(inData, outData);
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(USE_HIP)
     if constexpr (__CUDACC_VER_MAJOR__ == 13 && std::is_same_v<cuda::BaseType<SrcT>, uchar>)
     {
         // Retain the baseline U8 specialization for the CUDA 13 SM90 regression.
@@ -1711,6 +1712,7 @@ inline void Launch_BGR_to_YUV(const nvcv::TensorDataStridedCuda &inData, const n
         NVCV_CHECK_THROW(cvcuda::priv::GetCurrentDeviceSM(sm));
         wide |= sm == 90;
     }
+#endif
     WithTensorWrapsNHW<SrcT, DstT>(
         wide, inData, outData,
         [&](auto srcWrap, auto dstWrap)
@@ -1820,6 +1822,7 @@ inline void Launch_YUV_to_BGR(const nvcv::TensorDataStridedCuda &inData, const n
     int2 dstSize{shape.W, shape.H};
 
     bool wide = NeedsWideStrides(inData, outData);
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(USE_HIP)
     if constexpr (__CUDACC_VER_MAJOR__ == 13 && std::is_same_v<cuda::BaseType<SrcT>, uchar>)
     {
         // Retain the baseline U8 specialization for the CUDA 13 SM90 regression.
@@ -1827,6 +1830,7 @@ inline void Launch_YUV_to_BGR(const nvcv::TensorDataStridedCuda &inData, const n
         NVCV_CHECK_THROW(cvcuda::priv::GetCurrentDeviceSM(sm));
         wide |= sm == 90;
     }
+#endif
     WithTensorWrapsNHW<SrcT, DstT>(
         wide, inData, outData,
         [&](auto srcWrap, auto dstWrap)

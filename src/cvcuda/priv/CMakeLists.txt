@@ -109,10 +109,11 @@ else()
     list(APPEND CV_CUDA_PRIV_FILES ${CV_CUDA_PRIV_OP_FILES})
 endif()
 
-# The on-screen display drawing path (OSD, bounding box, box blur) is not built
-# for ROCm yet; the rest of the operators are.
+# The on-screen display drawing path (OSD, bounding box, box blur, and the
+# renderer and text backend only they use) is not built for ROCm yet; the rest of
+# the operators are.
 if(USE_HIP)
-    list(FILTER CV_CUDA_PRIV_FILES EXCLUDE REGEX "OpOSD|OpBndBox|OpBoxBlur")
+    list(FILTER CV_CUDA_PRIV_FILES EXCLUDE REGEX "OpOSD|OpBndBox|OpBoxBlur|OsdRenderer|textbackend/")
 endif()
 
 cvcuda_add_targeted_cuda_architectures_to_sources(

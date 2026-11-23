@@ -1268,7 +1268,14 @@ static bool TryFusedAA(cudaStream_t stream, View src, View dst, AxisCoefficients
     }
     // The opt-in is per device context, so it cannot be cached process-wide.
     if (bytes > 48 * 1024
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+        // HIP's hipFuncSetAttribute takes the kernel as an untyped pointer.
+        && cudaFuncSetAttribute(reinterpret_cast<const void *>(&FusedAA<T>),
+                                cudaFuncAttributeMaxDynamicSharedMemorySize, kFusedBytes)
+               != cudaSuccess)
+#else
         && cudaFuncSetAttribute(FusedAA<T>, cudaFuncAttributeMaxDynamicSharedMemorySize, kFusedBytes) != cudaSuccess)
+#endif
     {
         cudaGetLastError();
         return false;

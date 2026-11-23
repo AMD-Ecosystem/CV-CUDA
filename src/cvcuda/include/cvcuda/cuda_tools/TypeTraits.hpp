@@ -181,13 +181,29 @@ constexpr BaseType<T> Lowest = []
 // Largest finite __half value: 65504.
 inline __host__ __device__ __half HalfMax()
 {
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+    // HIP's __half_raw is a union led by a _Float16 member, so braces would convert the
+    // bit pattern as a number; set the raw bits explicitly.
+    __half_raw raw;
+    raw.x = 0x7BFFU;
+    return __half(raw);
+#else
     return __half(__half_raw{0x7BFFU});
+#endif
 }
 
 // Lowest finite __half value: -65504.
 inline __host__ __device__ __half HalfLowest()
 {
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+    // HIP's __half_raw is a union led by a _Float16 member, so braces would convert the
+    // bit pattern as a number; set the raw bits explicitly.
+    __half_raw raw;
+    raw.x = 0xFBFFU;
+    return __half(raw);
+#else
     return __half(__half_raw{0xFBFFU});
+#endif
 }
 
 /**@}*/

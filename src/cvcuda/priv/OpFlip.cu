@@ -545,6 +545,7 @@ void RunFlipPlanarTensor(cudaStream_t stream, const nvcv::TensorDataStridedCuda 
             // CUDA 12 on SM80 has unstable event completion after 128-bit accesses; 64-bit accesses
             // retain vectorization without affecting CUDA 13 or other architectures. `if constexpr`
             // so CUDA 13 does not instantiate the narrowed kernels at all.
+#if !defined(__HIP_PLATFORM_AMD__) && !defined(USE_HIP)
             if constexpr (CUDART_VERSION < 13000)
             {
                 if (computeCapability == 80 && WideSingleChannelEligible<T, 2>(inView, inAccess)
@@ -554,6 +555,7 @@ void RunFlipPlanarTensor(cudaStream_t stream, const nvcv::TensorDataStridedCuda 
                     return;
                 }
             }
+#endif
         }
     }
 

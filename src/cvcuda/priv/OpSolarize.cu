@@ -122,6 +122,8 @@ struct SolarizeThreshold<double>
         // Prevent NVCC from rematerializing the integer masks and zero tests as FP64 operations.
         asm("mov.b64 %0, %1;" : "=l"(bits) : "d"(v));
         return bits;
+#elif defined(__HIP_DEVICE_COMPILE__)
+        return static_cast<unsigned long long>(__double_as_longlong(v));
 #else
         unsigned long long bits;
         std::memcpy(&bits, &v, sizeof(bits));

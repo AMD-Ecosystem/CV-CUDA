@@ -112,6 +112,43 @@ NVCV_CUDA_UNARY_OPERATOR(~, nvcv::cuda::detail::IsIntegralCompound)
 
 #undef NVCV_CUDA_UNARY_OPERATOR
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+// HIP_vector_type has member operator- (signed elements) and operator~ (integral
+// elements) that keep the element type, and a member is more specialized than the
+// generic operator above. For char and short elements that drops the integer
+// promotion CUDA's operators apply (-short1 is int1 there). Non-template overloads
+// for exactly those element types are preferred over the member templates.
+#    define NVCV_CUDA_HIP_UNARY_PROMOTE(OPERATOR, T)                                            \
+        inline __host__ __device__ auto operator OPERATOR(HIP_vector_type<T, 1> a)              \
+        {                                                                                       \
+            return nvcv::cuda::MakeType<decltype(OPERATOR std::declval<T>()), 1>{OPERATOR a.x}; \
+        }                                                                                       \
+        inline __host__ __device__ auto operator OPERATOR(HIP_vector_type<T, 2> a)              \
+        {                                                                                       \
+            using RT = nvcv::cuda::MakeType<decltype(OPERATOR std::declval<T>()), 2>;           \
+            return RT{OPERATOR a.x, OPERATOR a.y};                                              \
+        }                                                                                       \
+        inline __host__ __device__ auto operator OPERATOR(HIP_vector_type<T, 3> a)              \
+        {                                                                                       \
+            using RT = nvcv::cuda::MakeType<decltype(OPERATOR std::declval<T>()), 3>;           \
+            return RT{OPERATOR a.x, OPERATOR a.y, OPERATOR a.z};                                \
+        }                                                                                       \
+        inline __host__ __device__ auto operator OPERATOR(HIP_vector_type<T, 4> a)              \
+        {                                                                                       \
+            using RT = nvcv::cuda::MakeType<decltype(OPERATOR std::declval<T>()), 4>;           \
+            return RT{OPERATOR a.x, OPERATOR a.y, OPERATOR a.z, OPERATOR a.w};                  \
+        }
+
+NVCV_CUDA_HIP_UNARY_PROMOTE(-, char)
+NVCV_CUDA_HIP_UNARY_PROMOTE(-, short)
+NVCV_CUDA_HIP_UNARY_PROMOTE(~, char)
+NVCV_CUDA_HIP_UNARY_PROMOTE(~, unsigned char)
+NVCV_CUDA_HIP_UNARY_PROMOTE(~, short)
+NVCV_CUDA_HIP_UNARY_PROMOTE(~, unsigned short)
+
+#    undef NVCV_CUDA_HIP_UNARY_PROMOTE
+#endif
+
 // The element-wise body is shared between the generic operator and, on HIP, a
 // more-specialized compound-compound overload (see below). HIP's vector types
 // (HIP_vector_type) ship their own operator+(vec<T,n>, U) and operator+(U,
@@ -235,7 +272,44 @@ NVCV_CUDA_UNARY_OPERATOR(~, nvcv::cuda::detail::IsIntegralCompound)
         using RT = nvcv::cuda::MakeType<decltype(std::declval<unsigned int>() OPERATOR std::declval<T2>()), 3>;\
         return RT{a.x OPERATOR b.x, a.y OPERATOR b.y, a.z OPERATOR b.z};                                        \
     }
+// The half compounds (half1, __half2, half3, half4) are not HIP_vector_types, so HIP's
+// operator(U, const vec&) and operator(const vec&, U) take a half operand as their
+// unconstrained U and fail inside make_vector_type. An overload with the concrete half
+// type is more specialized and wins. Element access goes through a helper so that the
+// half operand stays dependent and no member beyond its width is ever named.
+namespace nvcv::cuda::detail {
+template<class A, class B, class F>
+inline __host__ __device__ auto HipElementwise(const A &a, const B &b, F f)
+{
+    using RT = nvcv::cuda::MakeType<decltype(f(std::declval<nvcv::cuda::BaseType<A>>(), std::declval<nvcv::cuda::BaseType<B>>())),
+                                    nvcv::cuda::NumElements<A>>;
+    RT out;
+    nvcv::cuda::GetElement<0>(out) = f(nvcv::cuda::GetElement<0>(a), nvcv::cuda::GetElement<0>(b));
+    if constexpr (nvcv::cuda::NumElements<A> >= 2)
+        nvcv::cuda::GetElement<1>(out) = f(nvcv::cuda::GetElement<1>(a), nvcv::cuda::GetElement<1>(b));
+    if constexpr (nvcv::cuda::NumElements<A> >= 3)
+        nvcv::cuda::GetElement<2>(out) = f(nvcv::cuda::GetElement<2>(a), nvcv::cuda::GetElement<2>(b));
+    if constexpr (nvcv::cuda::NumElements<A> == 4)
+        nvcv::cuda::GetElement<3>(out) = f(nvcv::cuda::GetElement<3>(a), nvcv::cuda::GetElement<3>(b));
+    return out;
+}
+} // namespace nvcv::cuda::detail
+#define NVCV_CUDA_BINARY_OPERATOR_HIP_HALF(OPERATOR, H)                                                         \
+    template<typename T2, unsigned int N, class = nvcv::cuda::Require<nvcv::cuda::NumElements<H> == (int)N>>    \
+    inline __host__ __device__ auto operator OPERATOR(const H &a, const HIP_vector_type<T2, N> &b)              \
+    {                                                                                                           \
+        return nvcv::cuda::detail::HipElementwise(a, b, [](auto x, auto y) { return x OPERATOR y; });           \
+    }                                                                                                           \
+    template<typename T1, unsigned int N, class = nvcv::cuda::Require<nvcv::cuda::NumElements<H> == (int)N>>    \
+    inline __host__ __device__ auto operator OPERATOR(const HIP_vector_type<T1, N> &a, const H &b)              \
+    {                                                                                                           \
+        return nvcv::cuda::detail::HipElementwise(a, b, [](auto x, auto y) { return x OPERATOR y; });           \
+    }
 #define NVCV_CUDA_BINARY_OPERATOR_HIP(OPERATOR)                                                                 \
+    NVCV_CUDA_BINARY_OPERATOR_HIP_HALF(OPERATOR, half1)                                                         \
+    NVCV_CUDA_BINARY_OPERATOR_HIP_HALF(OPERATOR, __half2)                                                       \
+    NVCV_CUDA_BINARY_OPERATOR_HIP_HALF(OPERATOR, half3)                                                         \
+    NVCV_CUDA_BINARY_OPERATOR_HIP_HALF(OPERATOR, half4)                                                         \
     template<typename T1, typename T2, unsigned int N,                                                          \
              class = nvcv::cuda::Require<!std::is_same_v<T1, T2>>>                                              \
     inline __host__ __device__ auto operator OPERATOR(const HIP_vector_type<T1, N> &a,                          \

@@ -57,14 +57,23 @@ inline __device__ BT AdjustSharpnessStore(float v, float bound)
     {
         (void)bound;
         unsigned int out;
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+        // Truncate toward zero and saturate, as cvt.rzi.sat does; NaN maps to 0 through fmaxf.
+        out = static_cast<unsigned int>(fminf(fmaxf(truncf(v), 0.0f), 255.0f));
+#else
         asm("cvt.rzi.sat.u8.f32 %0, %1;" : "=r"(out) : "f"(v));
+#endif
         return static_cast<BT>(out);
     }
     else if constexpr (std::is_same_v<BT, unsigned short>)
     {
         (void)bound;
         unsigned int out;
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+        out = static_cast<unsigned int>(fminf(fmaxf(truncf(v), 0.0f), 65535.0f));
+#else
         asm("cvt.rzi.sat.u16.f32 %0, %1;" : "=r"(out) : "f"(v));
+#endif
         return static_cast<BT>(out);
     }
     else

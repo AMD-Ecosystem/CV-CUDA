@@ -2465,7 +2465,11 @@ __device__ __forceinline__ void resizeAreaPlane(const cuda::ImageBatchVarShapeWr
             int sy2 = cuda::round<cuda::RoundMode::DOWN, int>(fsy2);
 
             using work_type = cuda::ConvertBaseTypeTo<float, T>;
-            work_type out   = {0};
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+            work_type out = {}; // HIP_vector_type's single-arg ctor is explicit; value-init zeroes all lanes
+#else
+            work_type out = {0};
+#endif
 
             // Integer downscale: the box [sx1,sx2) x [sy1,sy2) is fully in-bounds, so read the source
             // rows directly (pointer hoisted per row) instead of paying the per-tap border-wrap bounds
@@ -2499,7 +2503,11 @@ __device__ __forceinline__ void resizeAreaPlane(const cuda::ImageBatchVarShapeWr
             = 1.f / (fminf(scale_x, src.width(batch_idx) - fsx1) * fminf(scale_y, src.height(batch_idx) - fsy1));
 
         using work_type = cuda::ConvertBaseTypeTo<float, T>;
-        work_type out   = {0};
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+        work_type out = {}; // HIP_vector_type's single-arg ctor is explicit; value-init zeroes all lanes
+#else
+        work_type out = {0};
+#endif
 
         int4 srcCoord = {0, 0, plane, batch_idx};
 
@@ -2680,12 +2688,16 @@ __device__ __forceinline__ void resizeAreaContract2xPlane(const cuda::ImageBatch
 #pragma unroll
     for (int i = 0; i < NIX<T>; ++i)
     {
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+        work_type acc = {}; // HIP_vector_type's single-arg ctor is explicit; value-init zeroes all lanes
+#else
         work_type acc = {0};
-        acc           = acc + win0[2 * i] * 0.25f;
-        acc           = acc + win0[2 * i + 1] * 0.25f;
-        acc           = acc + win1[2 * i] * 0.25f;
-        acc           = acc + win1[2 * i + 1] * 0.25f;
-        out[i]        = cuda::SaturateCast<T>(acc);
+#endif
+        acc    = acc + win0[2 * i] * 0.25f;
+        acc    = acc + win0[2 * i + 1] * 0.25f;
+        acc    = acc + win1[2 * i] * 0.25f;
+        acc    = acc + win1[2 * i + 1] * 0.25f;
+        out[i] = cuda::SaturateCast<T>(acc);
     }
 
     T *dstRow = dst.ptr(batch_idx, plane, y, 0);
@@ -3174,7 +3186,11 @@ __global__ void resize_area_fractional_pack_planar(cuda::ImageBatchVarShapeWrap<
                 scale[0]    = 1.f / (fminf(scale_x, width - fsx1[0]) * fminf(scale_y, height - fsy1));
             }
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+            work_type acc = {}; // HIP_vector_type's single-arg ctor is explicit; value-init zeroes all lanes
+#else
             work_type acc = {0};
+#endif
 
             for (int dy = sy1; dy < sy2; ++dy)
             {
@@ -3302,7 +3318,11 @@ __global__ void resize_area_ocv_align_planar(const cuda::ImageBatchVarShapeWrap<
             // per row) instead of the per-tap border-wrap. Bit-exact and identical to the interleaved path.
             for (int plane = 0; plane < channels; ++plane)
             {
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+                work_type out = {}; // HIP_vector_type's single-arg ctor is explicit; value-init zeroes all lanes
+#else
                 work_type out = {0};
+#endif
                 for (int dy = sy1; dy < sy2; ++dy)
                 {
                     const T *srcRow = src.ptr(batch_idx, plane, dy, 0);
@@ -3321,8 +3341,12 @@ __global__ void resize_area_ocv_align_planar(const cuda::ImageBatchVarShapeWrap<
 
         for (int plane = 0; plane < channels; ++plane)
         {
-            work_type out      = {0};
-            int4      srcCoord = {0, 0, plane, batch_idx};
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+            work_type out = {}; // HIP_vector_type's single-arg ctor is explicit; value-init zeroes all lanes
+#else
+            work_type out = {0};
+#endif
+            int4 srcCoord = {0, 0, plane, batch_idx};
 
             for (int dy = sy1; dy < sy2; ++dy)
             {
