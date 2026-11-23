@@ -57,6 +57,12 @@
 #define CUDA_VERSION 12020
 #endif
 
+// __grid_constant__ marks a const kernel parameter that may be read in place rather
+// than copied; HIP kernel arguments need no such annotation.
+#ifndef __grid_constant__
+#define __grid_constant__
+#endif
+
 // ---- runtime: error/status -------------------------------------------------
 #define cudaError_t                hipError_t
 #define cudaError                  hipError_t
@@ -68,6 +74,8 @@
 #define cudaErrorTextureFetchFailed hipErrorInvalidTexture
 #define cudaErrorNoDevice          hipErrorNoDevice
 #define cudaErrorInsufficientDriver hipErrorInsufficientDriver
+#define cudaErrorIllegalAddress    hipErrorIllegalAddress
+#define cudaErrorInvalidConfiguration hipErrorInvalidConfiguration
 #define cudaGetLastError           hipGetLastError
 #define cudaPeekAtLastError        hipPeekAtLastError
 #define cudaGetErrorString         hipGetErrorString
@@ -83,6 +91,12 @@
 #define cudaGetDeviceProperties    hipGetDeviceProperties
 #define cudaDevAttrTextureAlignment      hipDeviceAttributeTextureAlignment
 #define cudaDevAttrTexturePitchAlignment hipDeviceAttributeTexturePitchAlignment
+#define cudaDevAttrMultiProcessorCount         hipDeviceAttributeMultiprocessorCount
+#define cudaDevAttrMaxThreadsPerMultiProcessor hipDeviceAttributeMaxThreadsPerMultiProcessor
+#define cudaDevAttrL2CacheSize                 hipDeviceAttributeL2CacheSize
+#define cudaDevAttrIntegrated                  hipDeviceAttributeIntegrated
+#define cudaFuncSetAttribute                   hipFuncSetAttribute
+#define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 
 // The compute-capability attributes only pick between equivalent kernel
 // implementations tuned per SKU. HIP reports the GPU architecture's major and
@@ -157,6 +171,11 @@ __host__ inline hipError_t cvcuda_hipDeviceGetAttribute(int *value, hipDeviceAtt
 #define cudaMemoryTypeDevice       hipMemoryTypeDevice
 #define cudaMemoryTypeManaged      hipMemoryTypeManaged
 #define cudaMemoryTypeUnregistered hipMemoryTypeUnregistered
+#define cudaArray                  hipArray
+#define cudaArray_t                hipArray_t
+#define cudaMallocArray            hipMallocArray
+#define cudaFreeArray              hipFreeArray
+#define cudaCreateChannelDesc      hipCreateChannelDesc
 
 // ---- runtime: stream / event ----------------------------------------------
 #define cudaStream_t                       hipStream_t
@@ -193,12 +212,54 @@ __host__ inline hipError_t cvcuda_hipDeviceGetAttribute(int *value, hipDeviceAtt
 #define cudaStreamBeginCapture             hipStreamBeginCapture
 #define cudaStreamEndCapture               hipStreamEndCapture
 #define cudaStreamIsCapturing              hipStreamIsCapturing
+#define cudaStreamCaptureModeThreadLocal   hipStreamCaptureModeThreadLocal
+#define cudaGraphExec_t                    hipGraphExec_t
+#define cudaGraphInstantiate               hipGraphInstantiate
+#define cudaGraphLaunch                    hipGraphLaunch
+#define cudaGraphExecDestroy               hipGraphExecDestroy
+#define cudaGraphNodeType                  hipGraphNodeType
+#define cudaGraphNodeTypeKernel            hipGraphNodeTypeKernel
+#define cudaGraphNodeGetType               hipGraphNodeGetType
+#define cudaLaunchHostFunc                 hipLaunchHostFunc
+#define CUDART_CB
 
 // ---- full-wavefront mask ---------------------------------------------------
 // __shfl*_sync on ROCm static_asserts a 64-bit mask regardless of wave width.
 // The width argument (kept explicit at every call site that needs it) controls
 // the subgroup; the mask just marks participants.
 #define NVCV_WARP_FULL_MASK 0xffffffffffffffffULL
+
+// ---- 32-lane group vote ------------------------------------------------------
+// Kernels that give each 32-lane warp its own work item vote with __any_sync over the
+// warp. A 64-lane wavefront holds two such groups, so the vote is taken over the active
+// lanes of the caller's own 32-lane group. On a 32-lane wavefront that is the whole wave.
+#if defined(__cplusplus) && defined(__HIPCC__)
+__device__ __forceinline__ bool cvcuda_hipAnyInGroup32(bool pred)
+{
+    const unsigned long long votes = __ballot(pred);
+    return ((votes >> (__lane_id() & ~31u)) & 0xffffffffull) != 0;
+}
+#endif
+
+// ---- SIMD-in-word compares -------------------------------------------------
+// CUDA's per-byte and per-halfword unsigned >= compares, which HIP does not provide.
+// Each lane of the result is all ones where a >= b and zero otherwise.
+#if defined(__cplusplus) && defined(__HIPCC__)
+__device__ __forceinline__ unsigned int __vcmpgeu4(unsigned int a, unsigned int b)
+{
+    unsigned int r = 0;
+#pragma unroll
+    for (int i = 0; i < 32; i += 8)
+    {
+        r |= (((a >> i) & 0xffu) >= ((b >> i) & 0xffu) ? 0xffu : 0u) << i;
+    }
+    return r;
+}
+__device__ __forceinline__ unsigned int __vcmpgeu2(unsigned int a, unsigned int b)
+{
+    return (((a & 0xffffu) >= (b & 0xffffu)) ? 0x0000ffffu : 0u) | (((a >> 16) >= (b >> 16)) ? 0xffff0000u : 0u);
+}
+#endif
 
 // ---- host-side wavefront width ---------------------------------------------
 // AMD GPUs run 32-lane (RDNA) or 64-lane (CDNA/GCN) wavefronts, so no compile-time
