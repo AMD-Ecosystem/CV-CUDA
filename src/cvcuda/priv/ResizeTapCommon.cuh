@@ -161,7 +161,7 @@ template<typename T>
 __device__ __forceinline__ T LinearBlendW(T p00, T p10, T p01, T p11, float q00, float q10, float q01, float q11)
 {
     return cuda::SaturateCast<T>(
-        NVCV_CUDA_ADDMUL(NVCV_CUDA_ADDMUL(NVCV_CUDA_ADDMUL(p00 * q00, p10, q10), p01, q01), p11, q11));
+        NVCV_CUDA_ADDMUL(NVCV_CUDA_ADDMUL(NVCV_CUDA_MULADD(p00, q00, p10 * q10), p01, q01), p11, q11));
 }
 
 // CUBIC reductions ------------------------------------------------------------

@@ -228,7 +228,7 @@ template<typename T>
 __device__ __forceinline__ T LinearBlend(T p00, T p10, T p01, T p11, float2 w)
 {
     return cuda::SaturateCast<T>(
-        NVCV_CUDA_ADDMUL(NVCV_CUDA_ADDMUL(NVCV_CUDA_ADDMUL(p00 * ((1.f - w.x) * (1.f - w.y)), p10, (w.x * (1.f - w.y))),
+        NVCV_CUDA_ADDMUL(NVCV_CUDA_ADDMUL(NVCV_CUDA_MULADD(p00, ((1.f - w.x) * (1.f - w.y)), p10 * (w.x * (1.f - w.y))),
                                           p01, ((1.f - w.x) * w.y)),
                          p11, (w.x * w.y)));
 }
@@ -239,7 +239,7 @@ template<typename T>
 __device__ __forceinline__ T LinearBlendPack(const LinearFT<T> (&p)[4], float2 w)
 {
     return cuda::SaturateCast<T>(NVCV_CUDA_ADDMUL(
-        NVCV_CUDA_ADDMUL(NVCV_CUDA_ADDMUL(p[0] * ((1.f - w.x) * (1.f - w.y)), p[1], (w.x * (1.f - w.y))), p[2],
+        NVCV_CUDA_ADDMUL(NVCV_CUDA_MULADD(p[0], ((1.f - w.x) * (1.f - w.y)), p[1] * (w.x * (1.f - w.y))), p[2],
                          ((1.f - w.x) * w.y)),
         p[3], (w.x * w.y)));
 }
@@ -2049,8 +2049,8 @@ __global__ void resize_bilinear(cuda::ImageBatchVarShapeWrap<const T> src, cuda:
         sx = cuda::max(0, cuda::min(sx, width - 2));
 
         *dst.ptr(batch_idx, 0, dst_y, dst_x) = cuda::SaturateCast<T>(
-            NVCV_CUDA_ADDMUL((1.0f - fx) * NVCV_CUDA_ADDMUL(aPtr[sx] * (1.0f - fy), bPtr[sx], fy), fx,
-                             NVCV_CUDA_ADDMUL(aPtr[sx + 1] * (1.0f - fy), bPtr[sx + 1], fy)));
+            NVCV_CUDA_MULADD((1.0f - fx), NVCV_CUDA_MULADD(aPtr[sx], (1.0f - fy), bPtr[sx] * fy),
+                             fx * NVCV_CUDA_MULADD(aPtr[sx + 1], (1.0f - fy), bPtr[sx + 1] * fy)));
     }
 } //resize_bilinear
 
@@ -2112,11 +2112,11 @@ __global__ void resize_bilinear_expand2x(cuda::ImageBatchVarShapeWrap<const T> s
         const int   cb  = (i / 2) + (odd ? 1 : 0); // window column of the first x tap
 
         out0[i] = cuda::SaturateCast<T>(
-            NVCV_CUDA_ADDMUL((1.0f - fx) * NVCV_CUDA_ADDMUL(win[0][cb] * (1.0f - fyE), win[1][cb], fyE), fx,
-                             NVCV_CUDA_ADDMUL(win[0][cb + 1] * (1.0f - fyE), win[1][cb + 1], fyE)));
+            NVCV_CUDA_MULADD((1.0f - fx), NVCV_CUDA_MULADD(win[0][cb], (1.0f - fyE), win[1][cb] * fyE),
+                             fx * NVCV_CUDA_MULADD(win[0][cb + 1], (1.0f - fyE), win[1][cb + 1] * fyE)));
         out1[i] = cuda::SaturateCast<T>(
-            NVCV_CUDA_ADDMUL((1.0f - fx) * NVCV_CUDA_ADDMUL(win[1][cb] * (1.0f - fyO), win[2][cb], fyO), fx,
-                             NVCV_CUDA_ADDMUL(win[1][cb + 1] * (1.0f - fyO), win[2][cb + 1], fyO)));
+            NVCV_CUDA_MULADD((1.0f - fx), NVCV_CUDA_MULADD(win[1][cb], (1.0f - fyO), win[2][cb] * fyO),
+                             fx * NVCV_CUDA_MULADD(win[1][cb + 1], (1.0f - fyO), win[2][cb + 1] * fyO)));
     }
 
     const int validCount = cuda::min(NIX<T>, dstWidth - dst_x0);
@@ -2209,8 +2209,8 @@ __global__ void resize_bilinear_pack(cuda::ImageBatchVarShapeWrap<const T> src, 
         }
         prevSx = sx;
 
-        out[i] = cuda::SaturateCast<T>(NVCV_CUDA_ADDMUL((1.0f - fx) * NVCV_CUDA_ADDMUL(a0 * (1.0f - fy), b0, fy), fx,
-                                                        NVCV_CUDA_ADDMUL(a1 * (1.0f - fy), b1, fy)));
+        out[i] = cuda::SaturateCast<T>(NVCV_CUDA_MULADD((1.0f - fx), NVCV_CUDA_MULADD(a0, (1.0f - fy), b0 * fy),
+                                                        fx * NVCV_CUDA_MULADD(a1, (1.0f - fy), b1 * fy)));
     }
 
     T        *dstRow     = dst.ptr(batch_idx, 0, dst_y, 0);
@@ -3040,8 +3040,8 @@ __global__ void resize_bilinear_planar(cuda::ImageBatchVarShapeWrap<const T> src
             const int   sx = sxA[i];
             const float fx = fxA[i];
             *dst.ptr(batch_idx, plane, dst_y, dx[i]) = cuda::SaturateCast<T>(
-                NVCV_CUDA_ADDMUL((1.0f - fx) * NVCV_CUDA_ADDMUL(aPtr[sx] * (1.0f - fy), bPtr[sx], fy), fx,
-                                 NVCV_CUDA_ADDMUL(aPtr[sx + 1] * (1.0f - fy), bPtr[sx + 1], fy)));
+                NVCV_CUDA_MULADD((1.0f - fx), NVCV_CUDA_MULADD(aPtr[sx], (1.0f - fy), bPtr[sx] * fy),
+                                 fx * NVCV_CUDA_MULADD(aPtr[sx + 1], (1.0f - fy), bPtr[sx + 1] * fy)));
         }
     }
 }
