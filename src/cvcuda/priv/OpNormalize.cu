@@ -181,7 +181,7 @@ __device__ __forceinline__ int4 PlanarBroadcastIndex(int4 param_size, int batch,
 template<typename S>
 __device__ __forceinline__ auto InvStdDevMul(S scale, float epsilon)
 {
-    return 1.0f / cuda::sqrt(scale * scale + epsilon);
+    return 1.0f / cuda::sqrt(NVCV_CUDA_MULADD(scale, scale, epsilon));
 }
 
 // The interleaved kernels promote F64 implicitly through their wrapped pixel types; the helpers
@@ -632,9 +632,9 @@ __global__ void normalizeKernel(const input_type src, const base_type base, cons
     using input_value_type = typename input_type::ValueType;
 
     *dst.ptr(batch_idx, src_y, src_x) = cuda::SaturateCast<input_value_type>(
-        (*src.ptr(batch_idx, src_y, src_x) - *base.ptr(base_batch_idx, base_y, base_x))
-            * (*scale.ptr(scale_batch_idx, scale_y, scale_x)) * global_scale
-        + global_shift);
+        NVCV_CUDA_MULADD((*src.ptr(batch_idx, src_y, src_x) - *base.ptr(base_batch_idx, base_y, base_x))
+                             * (*scale.ptr(scale_batch_idx, scale_y, scale_x)),
+                         global_scale, global_shift));
 }
 
 template<typename input_type, typename base_type, typename scale_type>
@@ -663,8 +663,8 @@ __global__ void normalizeInvStdDevKernel(const input_type src, const base_type b
     scale_value_type mul = InvStdDevMul(*scale.ptr(scale_batch_idx, scale_y, scale_x), epsilon);
 
     *dst.ptr(batch_idx, src_y, src_x) = cuda::SaturateCast<input_value_type>(
-        (*src.ptr(batch_idx, src_y, src_x) - *base.ptr(base_batch_idx, base_y, base_x)) * mul * global_scale
-        + global_shift);
+        NVCV_CUDA_MULADD((*src.ptr(batch_idx, src_y, src_x) - *base.ptr(base_batch_idx, base_y, base_x)) * mul,
+                         global_scale, global_shift));
 }
 
 // The scalar kernel recomputes 1 / sqrt(scale^2 + eps) per pixel; for multi-channel interleaved input
@@ -699,7 +699,7 @@ __global__ void normalizeInvStdDevHoistKernel(const input_type src, const base_t
         if (src_x < inout_size.x)
         {
             *dst.ptr(batch_idx, src_y, src_x) = cuda::SaturateCast<input_value_type>(
-                (*src.ptr(batch_idx, src_y, src_x) - b) * mul * global_scale + global_shift);
+                NVCV_CUDA_MULADD((*src.ptr(batch_idx, src_y, src_x) - b) * mul, global_scale, global_shift));
         }
     }
 }
@@ -1241,7 +1241,8 @@ __global__ void normKernel(const cuda::ImageBatchVarShapeWrap<const T> src, cuda
         return;
 
     T out                             = *src.ptr(batch_idx, dst_y, dst_x);
-    *dst.ptr(batch_idx, dst_y, dst_x) = cuda::SaturateCast<out_T>((out - *base) * *scale * global_scale + global_shift);
+    *dst.ptr(batch_idx, dst_y, dst_x)
+        = cuda::SaturateCast<out_T>(NVCV_CUDA_MULADD((out - *base) * *scale, global_scale, global_shift));
 }
 
 template<typename T, typename out_T, typename base_type, typename scale_type>
@@ -1258,7 +1259,8 @@ __global__ void normInvStdDevKernel(const cuda::ImageBatchVarShapeWrap<const T> 
     scale_type mul = InvStdDevMul(*scale, epsilon);
 
     T out                             = *src.ptr(batch_idx, dst_y, dst_x);
-    *dst.ptr(batch_idx, dst_y, dst_x) = cuda::SaturateCast<out_T>((out - *base) * mul * global_scale + global_shift);
+    *dst.ptr(batch_idx, dst_y, dst_x)
+        = cuda::SaturateCast<out_T>(NVCV_CUDA_MULADD((out - *base) * mul, global_scale, global_shift));
 }
 
 // Relies on NVCV's image row-pitch alignment (>= sizeof(Vec4)).
@@ -1285,7 +1287,7 @@ __global__ void normInvStdDevVec4Kernel(const cuda::ImageBatchVarShapeWrap<const
 
     auto apply = [&](VecBase raw) -> out_T
     {
-        return cuda::SaturateCast<out_T>((raw - b) * mul * global_scale + global_shift);
+        return cuda::SaturateCast<out_T>(NVCV_CUDA_MULADD((raw - b) * mul, global_scale, global_shift));
     };
 
     int  cx[NGROUP];
@@ -1345,7 +1347,7 @@ __global__ void normInvStdDevHoistKernel(const cuda::ImageBatchVarShapeWrap<cons
         if (dst_x < width)
         {
             *dst.ptr(batch_idx, dst_y, dst_x) = cuda::SaturateCast<out_T>(
-                (*src.ptr(batch_idx, dst_y, dst_x) - b) * mul * global_scale + global_shift);
+                NVCV_CUDA_MULADD((*src.ptr(batch_idx, dst_y, dst_x) - b) * mul, global_scale, global_shift));
         }
     }
 }

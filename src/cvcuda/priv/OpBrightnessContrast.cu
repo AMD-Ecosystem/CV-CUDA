@@ -269,7 +269,8 @@ inline __device__ DstT ApplyBrightnessContrast(SrcT v, const SampleArgs<ArgT, Is
     {
         pixel = cuda::StaticCast<BI>(v);
     }
-    pixel = arg.brightnessShift + arg.brightness * (arg.contrastCenter + arg.contrast * (pixel - arg.contrastCenter));
+    pixel = NVCV_CUDA_ADDMUL(arg.brightnessShift, arg.brightness,
+                             NVCV_CUDA_ADDMUL(arg.contrastCenter, arg.contrast, (pixel - arg.contrastCenter)));
     if constexpr (kClampMode == BCClampMode::Runtime)
     {
         if constexpr (IsScalar)

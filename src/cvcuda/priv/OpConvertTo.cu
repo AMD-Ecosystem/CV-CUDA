@@ -98,7 +98,7 @@ struct Convertor
 
     __device__ __forceinline__ DST_TYPE operator()(SRC_TYPE src) const
     {
-        auto work = alpha * src + beta;
+        auto work = NVCV_CUDA_MULADD(alpha, src, beta);
         if constexpr (std::is_integral_v<cuda::BaseType<DST_TYPE>>)
         {
             if (truncate)
