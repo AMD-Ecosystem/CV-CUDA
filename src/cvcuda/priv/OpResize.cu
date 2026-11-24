@@ -229,6 +229,8 @@ __device__ __forceinline__ T LinearBlend(T p00, T p10, T p01, T p11, float2 w)
 {
 #if defined(__HIP_DEVICE_COMPILE__)
     // nvcc fuses the p10 product of the first two terms for these types and the p00 product for the others.
+    // LinearBlendPack (INTERSECT path) and LinearBlendW (planar path) keep the p00 product for them, so those
+    // paths can differ from this one in the last bit; under nvcc the INTERSECT path can differ the same way.
     if constexpr (std::is_same_v<T, uchar1> || std::is_same_v<T, uchar4>)
     {
         return cuda::SaturateCast<T>(NVCV_CUDA_ADDMUL(
