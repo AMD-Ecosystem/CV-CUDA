@@ -169,7 +169,14 @@ __global__ void RotateTensorKernel(SrcWrapper src, DstWrapper dst, int2 dstSize,
         }
 
         const float  dst_y_shift = static_cast<float>(dst_y) - c5;
+#if defined(__HIP_DEVICE_COMPILE__)
+        // With one row per thread nvcc fuses the x * c0 product here; clang would fuse the other one.
+        const float src_x
+            = NIY == 1 ? __fmaf_rn(dst_x_shift, c0, dst_y_shift * (-c1)) : src_x_col + dst_y_shift * (-c1);
+        const float3 srcCoord{src_x, src_y_col + dst_y_shift * c4, static_cast<float>(dst_z)};
+#else
         const float3 srcCoord{src_x_col + dst_y_shift * (-c1), src_y_col + dst_y_shift * c4, static_cast<float>(dst_z)};
+#endif
 
         if (srcCoord.x > -0.5 && srcCoord.x < srcSize.x && srcCoord.y > -0.5 && srcCoord.y < srcSize.y)
         {
@@ -240,7 +247,7 @@ __global__ void RotatePlanarFusedTensorKernel(SrcWrapper src, DstWrapper dst, in
 
     const float  dst_x_shift = static_cast<float>(dst_x) - d_aCoeffs[2];
     const float  dst_y_shift = static_cast<float>(dst_y) - d_aCoeffs[5];
-    const float2 coord{NVCV_CUDA_ADDMUL(dst_x_shift * d_aCoeffs[0], dst_y_shift, (-d_aCoeffs[1])),
+    const float2 coord{NVCV_CUDA_MULADD(dst_x_shift, d_aCoeffs[0], dst_y_shift * (-d_aCoeffs[1])),
                        NVCV_CUDA_ADDMUL(dst_x_shift * (-d_aCoeffs[3]), dst_y_shift, d_aCoeffs[4])};
 
     if (coord.x > -0.5f && coord.x < static_cast<float>(srcSize.x) && coord.y > -0.5f
@@ -290,7 +297,13 @@ __global__ void RotateVarShapeKernel(SrcWrapper src, DstWrapper dst, const float
             break;
 
         const float dst_y_shift = static_cast<float>(dst_y) - c5;
+#if defined(__HIP_DEVICE_COMPILE__)
+        // With one row per thread nvcc fuses the x * c0 product here; clang would fuse the other one.
+        const float src_x
+            = NIY == 1 ? __fmaf_rn(dst_x_shift, c0, dst_y_shift * (-c1)) : src_x_col + dst_y_shift * (-c1);
+#else
         const float src_x       = src_x_col + dst_y_shift * (-c1);
+#endif
         const float src_y       = src_y_col + dst_y_shift * c4;
 
         if (src_x > -0.5 && src_x < width && src_y > -0.5 && src_y < height)
@@ -353,7 +366,13 @@ __global__ void RotatePlanarVarShapeKernel(SrcWrapper src, DstWrapper dst, const
             break;
 
         const float dst_y_shift = static_cast<float>(dst_y) - c5;
+#if defined(__HIP_DEVICE_COMPILE__)
+        // With one row per thread nvcc fuses the x * c0 product here; clang would fuse the other one.
+        const float src_x
+            = NIY == 1 ? __fmaf_rn(dst_x_shift, c0, dst_y_shift * (-c1)) : src_x_col + dst_y_shift * (-c1);
+#else
         const float src_x       = src_x_col + dst_y_shift * (-c1);
+#endif
         const float src_y       = src_y_col + dst_y_shift * c4;
 
         if (src_x > -0.5 && src_x < width && src_y > -0.5 && src_y < height)
@@ -383,7 +402,7 @@ __global__ void RotatePlanarFusedVarShapeKernel(SrcWrapper src, DstWrapper dst, 
     const float *d_aCoeffs   = (const float *)((char *)d_aCoeffs_ + (sizeof(float) * kAffineCoeffs) * batch_idx);
     const float  dst_x_shift = static_cast<float>(dst_x) - d_aCoeffs[2];
     const float  dst_y_shift = static_cast<float>(dst_y) - d_aCoeffs[5];
-    const float2 coord{NVCV_CUDA_ADDMUL(dst_x_shift * d_aCoeffs[0], dst_y_shift, (-d_aCoeffs[1])),
+    const float2 coord{NVCV_CUDA_MULADD(dst_x_shift, d_aCoeffs[0], dst_y_shift * (-d_aCoeffs[1])),
                        NVCV_CUDA_ADDMUL(dst_x_shift * (-d_aCoeffs[3]), dst_y_shift, d_aCoeffs[4])};
 
     const int width  = src.width(batch_idx);
