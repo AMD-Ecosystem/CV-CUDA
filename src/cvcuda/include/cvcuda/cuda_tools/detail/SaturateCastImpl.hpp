@@ -229,6 +229,18 @@ NVCV_CUDA_SAT_DEF(short, __half, short, asm("cvt.rni.sat.s16.f16 %0, %1;" : "=h"
 
 // clang-format on
 
+#if defined(__HIP_DEVICE_COMPILE__)
+// The AMDGPU backend folds a float-to-half conversion into the multiply-add that produced the float
+// (v_fma_mixlo_f16), which rounds once to half instead of to float and then to half. The empty asm
+// keeps the float value the conversion is defined on.
+template<>
+__host__ __device__ __forceinline__ __half SaturateCastImpl<__half, float>(float u)
+{
+    asm("" : "+v"(u));
+    return BaseSaturateCastImpl<__half>(u);
+}
+#endif
+
 #undef NVCV_CUDA_SAT_DEF
 #undef NVCV_CUDA_SAT_BODY
 

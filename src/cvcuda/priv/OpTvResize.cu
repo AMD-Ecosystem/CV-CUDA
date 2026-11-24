@@ -500,6 +500,11 @@ __device__ int16_t StoreValue<int16_t>(float value)
 template<>
 __device__ __half StoreValue<__half>(float value)
 {
+#if defined(__HIP_PLATFORM_AMD__) || defined(USE_HIP)
+    // The AMDGPU backend folds this conversion into the multiply-add that produced value
+    // (v_fma_mixlo_f16), rounding once to half instead of to float and then to half.
+    asm("" : "+v"(value));
+#endif
     return __float2half_rn(value);
 }
 
