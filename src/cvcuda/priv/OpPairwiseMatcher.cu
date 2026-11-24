@@ -388,11 +388,6 @@ inline __device__ void SortKeyValue(float &sortedDist, int &sortedIdx, const Poi
             sortedIdx  = values[0];
         }
     }
-
-    // SortKeyValue is called twice in the crossCheck path and the compiler aliases
-    // the two function-local CUB TempStorage allocations. CUB requires a
-    // __syncthreads() before that shared storage is reused by the next collective.
-    __syncthreads();
 }
 
 // Write a match of (set1Idx, set2Idx) with (distance) found at matchIdx inside output matches and distances
