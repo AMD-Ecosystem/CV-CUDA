@@ -330,7 +330,8 @@ __global__ void ResizeLinear(const SrcWrapper src, DstWrapper dst, const Geometr
         const T *bPtr = src.ptr(batch_idx, ty.s + 1, 0); // lower row
 
 #if defined(__HIP_DEVICE_COMPILE__)
-        // For these instantiations nvcc fuses the lower-row product in the first column's blend.
+        // For these instantiations nvcc fuses the lower-row product in the first column's blend; the second
+        // column's blend and the horizontal blend fuse their first product, as in the other instantiations.
         constexpr bool kFuseLowerRow
             = std::is_same_v<Geometry, VarShapeGeometry> && (std::is_same_v<T, float> || std::is_same_v<T, float4>);
         if constexpr (kFuseLowerRow)
