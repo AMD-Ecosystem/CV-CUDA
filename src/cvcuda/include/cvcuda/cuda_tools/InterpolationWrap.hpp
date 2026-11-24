@@ -25,6 +25,7 @@
 #define NVCV_CUDA_INTERPOLATION_WRAP_HPP
 
 #include "BorderWrap.hpp"   // for TensorWrap, etc.
+#include "MathOps.hpp"      // for NVCV_CUDA_MULACC, etc.
 #include "MathWrappers.hpp" // for round, etc.
 #include "SaturateCast.hpp" // for SaturateCast, etc.
 
@@ -491,10 +492,10 @@ private:
 
         const auto zero = SetAll<std::remove_cv_t<ValueType>>(0);
         auto       out  = SetAll<ConvertBaseTypeTo<float, std::remove_cv_t<ValueType>>>(0);
-        out += (in11 ? *p11 : zero) * wx1 * wy1;
-        out += (in21 ? *p21 : zero) * wx2 * wy1;
-        out += (in12 ? *p12 : zero) * wx1 * wy2;
-        out += (in22 ? *p22 : zero) * wx2 * wy2;
+        NVCV_CUDA_MULACC(out, (in11 ? *p11 : zero) * wx1, wy1);
+        NVCV_CUDA_MULACC(out, (in21 ? *p21 : zero) * wx2, wy1);
+        NVCV_CUDA_MULACC(out, (in12 ? *p12 : zero) * wx1, wy2);
+        NVCV_CUDA_MULACC(out, (in22 ? *p22 : zero) * wx2, wy2);
 
         if (in11 && in21 && in12 && in22)
             return SaturateCast<ValueType>(out);
@@ -542,10 +543,10 @@ public:
         else
         {
             auto out = SetAll<ConvertBaseTypeTo<float, std::remove_cv_t<ValueType>>>(0);
-            out += Base::doGetValue(c, x1, y1) * wx1 * wy1;
-            out += Base::doGetValue(c, x1 + 1, y1) * wx2 * wy1;
-            out += Base::doGetValue(c, x1, y1 + 1) * wx1 * wy2;
-            out += Base::doGetValue(c, x1 + 1, y1 + 1) * wx2 * wy2;
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, x1, y1) * wx1), wy1);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, x1 + 1, y1) * wx2), wy1);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, x1, y1 + 1) * wx1), wy2);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, x1 + 1, y1 + 1) * wx2), wy2);
             return SaturateCast<ValueType>(out);
         }
     }
@@ -673,7 +674,7 @@ public:
                 }
                 else
                 {
-                    sum += Base::doGetValue(c, ix + cx, iy + cy) * weight;
+                    NVCV_CUDA_MULACC(sum, (Base::doGetValue(c, ix + cx, iy + cy)), weight);
                 }
             }
         }
@@ -883,7 +884,7 @@ private:
         {
             for (StrideType cx = bounds.xmin; cx < bounds.xmax; ++cx)
             {
-                out += Base::doGetValue(c, cx, cy) * scale;
+                NVCV_CUDA_MULACC(out, (Base::doGetValue(c, cx, cy)), scale);
             }
         }
     }
@@ -924,7 +925,7 @@ private:
         {
             for (StrideType cx = bounds.xmin; cx < bounds.xmax; ++cx)
             {
-                out += Base::doGetValue(c, cx, cy) * scale;
+                NVCV_CUDA_MULACC(out, (Base::doGetValue(c, cx, cy)), scale);
             }
 
             AddHorizontalEdgeCells(c, bounds, cy, scale, out);
@@ -937,12 +938,14 @@ private:
     {
         if (ToFloat(bounds.xmin) > bounds.fsx1)
         {
-            out += Base::doGetValue(c, (bounds.xmin - 1), cy) * ((ToFloat(bounds.xmin) - bounds.fsx1) * scale);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, (bounds.xmin - 1), cy)),
+                             ((ToFloat(bounds.xmin) - bounds.fsx1) * scale));
         }
 
         if (ToFloat(bounds.xmax) < bounds.fsx2)
         {
-            out += Base::doGetValue(c, bounds.xmax, cy) * ((bounds.fsx2 - ToFloat(bounds.xmax)) * scale);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, bounds.xmax, cy)),
+                             ((bounds.fsx2 - ToFloat(bounds.xmax)) * scale));
         }
     }
 
@@ -952,19 +955,20 @@ private:
     {
         for (StrideType cx = bounds.xmin; cx < bounds.xmax; ++cx)
         {
-            out += Base::doGetValue(c, cx, (bounds.ymin - 1)) * ((ToFloat(bounds.ymin) - bounds.fsy1) * scale);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, cx, (bounds.ymin - 1))),
+                             ((ToFloat(bounds.ymin) - bounds.fsy1) * scale));
         }
 
         if (ToFloat(bounds.xmin) > bounds.fsx1)
         {
-            out += Base::doGetValue(c, (bounds.xmin - 1), (bounds.ymin - 1))
-                 * ((ToFloat(bounds.ymin) - bounds.fsy1) * (ToFloat(bounds.xmin) - bounds.fsx1) * scale);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, (bounds.xmin - 1), (bounds.ymin - 1))),
+                             ((ToFloat(bounds.ymin) - bounds.fsy1) * (ToFloat(bounds.xmin) - bounds.fsx1) * scale));
         }
 
         if (ToFloat(bounds.xmax) < bounds.fsx2)
         {
-            out += Base::doGetValue(c, bounds.xmax, (bounds.ymin - 1))
-                 * ((ToFloat(bounds.ymin) - bounds.fsy1) * (bounds.fsx2 - ToFloat(bounds.xmax)) * scale);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, bounds.xmax, (bounds.ymin - 1))),
+                             ((ToFloat(bounds.ymin) - bounds.fsy1) * (bounds.fsx2 - ToFloat(bounds.xmax)) * scale));
         }
     }
 
@@ -974,19 +978,20 @@ private:
     {
         for (StrideType cx = bounds.xmin; cx < bounds.xmax; ++cx)
         {
-            out += Base::doGetValue(c, cx, bounds.ymax) * ((bounds.fsy2 - ToFloat(bounds.ymax)) * scale);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, cx, bounds.ymax)),
+                             ((bounds.fsy2 - ToFloat(bounds.ymax)) * scale));
         }
 
         if (ToFloat(bounds.xmax) < bounds.fsx2)
         {
-            out += Base::doGetValue(c, bounds.xmax, bounds.ymax)
-                 * ((bounds.fsy2 - ToFloat(bounds.ymax)) * (bounds.fsx2 - ToFloat(bounds.xmax)) * scale);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, bounds.xmax, bounds.ymax)),
+                             ((bounds.fsy2 - ToFloat(bounds.ymax)) * (bounds.fsx2 - ToFloat(bounds.xmax)) * scale));
         }
 
         if (ToFloat(bounds.xmin) > bounds.fsx1)
         {
-            out += Base::doGetValue(c, (bounds.xmin - 1), bounds.ymax)
-                 * ((bounds.fsy2 - ToFloat(bounds.ymax)) * (ToFloat(bounds.xmin) - bounds.fsx1) * scale);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, (bounds.xmin - 1), bounds.ymax)),
+                             ((bounds.fsy2 - ToFloat(bounds.ymax)) * (ToFloat(bounds.xmin) - bounds.fsx1) * scale));
         }
     }
 

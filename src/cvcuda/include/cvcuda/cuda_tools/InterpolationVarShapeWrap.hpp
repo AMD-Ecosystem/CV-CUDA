@@ -363,10 +363,10 @@ public:
 
         auto out = SetAll<ConvertBaseTypeTo<float, std::remove_cv_t<ValueType>>>(0);
 
-        out += Base::doGetValue(c, x1, y1) * (x2 - c.x) * (y2 - c.y);
-        out += Base::doGetValue(c, x2, y1) * (c.x - x1) * (y2 - c.y);
-        out += Base::doGetValue(c, x1, y2) * (x2 - c.x) * (c.y - y1);
-        out += Base::doGetValue(c, x2, y2) * (c.x - x1) * (c.y - y1);
+        NVCV_CUDA_MULACC(out, (Base::doGetValue(c, x1, y1) * (x2 - c.x)), (y2 - c.y));
+        NVCV_CUDA_MULACC(out, (Base::doGetValue(c, x2, y1) * (c.x - x1)), (y2 - c.y));
+        NVCV_CUDA_MULACC(out, (Base::doGetValue(c, x1, y2) * (x2 - c.x)), (c.y - y1));
+        NVCV_CUDA_MULACC(out, (Base::doGetValue(c, x2, y2) * (c.x - x1)), (c.y - y1));
 
         return SaturateCast<ValueType>(out);
     }
@@ -478,7 +478,7 @@ public:
 #pragma unroll
             for (int cx = -1; cx <= 2; cx++)
             {
-                sum += Base::doGetValue(c, ix + cx, iy + cy) * (wx[cx + 1] * wy[cy + 1]);
+                NVCV_CUDA_MULACC(sum, (Base::doGetValue(c, ix + cx, iy + cy)), (wx[cx + 1] * wy[cy + 1]));
             }
         }
 
@@ -649,7 +649,7 @@ private:
         {
             for (int cx = bounds.xmin; cx < bounds.xmax; ++cx)
             {
-                out += Base::doGetValue(c, cx, cy) * scale;
+                NVCV_CUDA_MULACC(out, (Base::doGetValue(c, cx, cy)), scale);
             }
         }
     }
@@ -715,7 +715,7 @@ private:
         {
             for (int cx = bounds.xmin; cx < bounds.xmax; ++cx)
             {
-                out += Base::doGetValue(c, cx, cy) * scale;
+                NVCV_CUDA_MULACC(out, (Base::doGetValue(c, cx, cy)), scale);
             }
 
             AddHorizontalEdgeCells(c, bounds, cy, scale, out);
@@ -728,12 +728,12 @@ private:
     {
         if (bounds.xmin > bounds.fsx1)
         {
-            out += Base::doGetValue(c, (bounds.xmin - 1), cy) * ((bounds.xmin - bounds.fsx1) * scale);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, (bounds.xmin - 1), cy)), ((bounds.xmin - bounds.fsx1) * scale));
         }
 
         if (bounds.xmax < bounds.fsx2)
         {
-            out += Base::doGetValue(c, bounds.xmax, cy) * ((bounds.fsx2 - bounds.xmax) * scale);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, bounds.xmax, cy)), ((bounds.fsx2 - bounds.xmax) * scale));
         }
     }
 
@@ -743,19 +743,19 @@ private:
     {
         for (int cx = bounds.xmin; cx < bounds.xmax; ++cx)
         {
-            out += Base::doGetValue(c, cx, (bounds.ymin - 1)) * ((bounds.ymin - bounds.fsy1) * scale);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, cx, (bounds.ymin - 1))), ((bounds.ymin - bounds.fsy1) * scale));
         }
 
         if (bounds.xmin > bounds.fsx1)
         {
-            out += Base::doGetValue(c, (bounds.xmin - 1), (bounds.ymin - 1))
-                 * ((bounds.ymin - bounds.fsy1) * (bounds.xmin - bounds.fsx1) * scale);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, (bounds.xmin - 1), (bounds.ymin - 1))),
+                             ((bounds.ymin - bounds.fsy1) * (bounds.xmin - bounds.fsx1) * scale));
         }
 
         if (bounds.xmax < bounds.fsx2)
         {
-            out += Base::doGetValue(c, bounds.xmax, (bounds.ymin - 1))
-                 * ((bounds.ymin - bounds.fsy1) * (bounds.fsx2 - bounds.xmax) * scale);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, bounds.xmax, (bounds.ymin - 1))),
+                             ((bounds.ymin - bounds.fsy1) * (bounds.fsx2 - bounds.xmax) * scale));
         }
     }
 
@@ -765,19 +765,19 @@ private:
     {
         for (int cx = bounds.xmin; cx < bounds.xmax; ++cx)
         {
-            out += Base::doGetValue(c, cx, bounds.ymax) * ((bounds.fsy2 - bounds.ymax) * scale);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, cx, bounds.ymax)), ((bounds.fsy2 - bounds.ymax) * scale));
         }
 
         if (bounds.xmax < bounds.fsx2)
         {
-            out += Base::doGetValue(c, bounds.xmax, bounds.ymax)
-                 * ((bounds.fsy2 - bounds.ymax) * (bounds.fsx2 - bounds.xmax) * scale);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, bounds.xmax, bounds.ymax)),
+                             ((bounds.fsy2 - bounds.ymax) * (bounds.fsx2 - bounds.xmax) * scale));
         }
 
         if (bounds.xmin > bounds.fsx1)
         {
-            out += Base::doGetValue(c, (bounds.xmin - 1), bounds.ymax)
-                 * ((bounds.fsy2 - bounds.ymax) * (bounds.xmin - bounds.fsx1) * scale);
+            NVCV_CUDA_MULACC(out, (Base::doGetValue(c, (bounds.xmin - 1), bounds.ymax)),
+                             ((bounds.fsy2 - bounds.ymax) * (bounds.xmin - bounds.fsx1) * scale));
         }
     }
 

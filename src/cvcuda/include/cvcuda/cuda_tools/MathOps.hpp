@@ -442,6 +442,55 @@ inline __host__ __device__ auto dot(T a, U b)
 
 } // namespace nvcv::cuda
 
+// nvcc fuses a * b + c into one multiply-add per element when it compiles device code, also when the
+// multiply and the add are separate compound-type operators, and the tests pin those results. clang
+// fuses only inside one source expression, so on the HIP device pass the call sites written with
+// these operators spell the fused operation out. Host code keeps the plain expressions, as host
+// compilers evaluate them in the CUDA build.
+#if defined(__HIP_DEVICE_COMPILE__)
+#    include <cmath> // for std::fma
+
+namespace nvcv::cuda::detail {
+
+// Integer elements, and a product narrower than the sum, keep the plain expression.
+template<typename A, typename B, typename C>
+inline __host__ __device__ auto HipFma(A a, B b, C c)
+{
+    using RT = decltype(a * b + c);
+    using PT = decltype(std::declval<nvcv::cuda::BaseType<A>>() * std::declval<nvcv::cuda::BaseType<B>>());
+    using ET = nvcv::cuda::BaseType<RT>;
+    if constexpr (!std::is_same_v<ET, float> && !std::is_same_v<ET, double>)
+        return a * b + c;
+    else if constexpr (!std::is_same_v<PT, ET>)
+        return a * b + c;
+    else
+    {
+        RT out;
+#    pragma unroll
+        for (int i = 0; i < nvcv::cuda::NumElements<RT>; ++i)
+        {
+            const ET x                     = static_cast<ET>(nvcv::cuda::GetElement(a, i));
+            const ET y                     = static_cast<ET>(nvcv::cuda::GetElement(b, i));
+            const ET z                     = static_cast<ET>(nvcv::cuda::GetElement(c, i));
+            nvcv::cuda::GetElement(out, i) = std::fma(x, y, z);
+        }
+        return out;
+    }
+}
+
+} // namespace nvcv::cuda::detail
+
+#    define NVCV_CUDA_MULADD(A, B, C) nvcv::cuda::detail::HipFma((A), (B), (C))
+#    define NVCV_CUDA_ADDMUL(C, A, B) nvcv::cuda::detail::HipFma((A), (B), (C))
+#    define NVCV_CUDA_MULACC(ACC, A, B)                                                                \
+        ((ACC) = nvcv::cuda::StaticCast<nvcv::cuda::BaseType<std::remove_reference_t<decltype(ACC)>>>( \
+             nvcv::cuda::detail::HipFma((A), (B), (ACC))))
+#else
+#    define NVCV_CUDA_MULADD(A, B, C)   ((A) * (B) + (C))
+#    define NVCV_CUDA_ADDMUL(C, A, B)   ((C) + (A) * (B))
+#    define NVCV_CUDA_MULACC(ACC, A, B) ((ACC) += (A) * (B))
+#endif
+
 /**@}*/
 
 #endif // NVCV_CUDA_MATH_OPS_HPP
