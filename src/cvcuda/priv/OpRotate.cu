@@ -198,12 +198,14 @@ __global__ void RotateTensorKernel(SrcWrapper src, DstWrapper dst, int2 dstSize,
                     LoadTapRow(srcTensor.ptr(srcSample, iy, ix), top);
                     LoadTapRow(srcTensor.ptr(srcSample, iy + 1, ix), bottom);
                     auto out = cuda::SetAll<float3>(0);
-                    out += top[0] * (static_cast<float>(ix + 1) - srcCoord.x)
-                         * (static_cast<float>(iy + 1) - srcCoord.y);
-                    out += top[1] * (srcCoord.x - static_cast<float>(ix)) * (static_cast<float>(iy + 1) - srcCoord.y);
-                    out += bottom[0] * (static_cast<float>(ix + 1) - srcCoord.x)
-                         * (srcCoord.y - static_cast<float>(iy));
-                    out += bottom[1] * (srcCoord.x - static_cast<float>(ix)) * (srcCoord.y - static_cast<float>(iy));
+                    NVCV_CUDA_MULACC(out, top[0] * (static_cast<float>(ix + 1) - srcCoord.x),
+                                     (static_cast<float>(iy + 1) - srcCoord.y));
+                    NVCV_CUDA_MULACC(out, top[1] * (srcCoord.x - static_cast<float>(ix)),
+                                     (static_cast<float>(iy + 1) - srcCoord.y));
+                    NVCV_CUDA_MULACC(out, bottom[0] * (static_cast<float>(ix + 1) - srcCoord.x),
+                                     (srcCoord.y - static_cast<float>(iy)));
+                    NVCV_CUDA_MULACC(out, bottom[1] * (srcCoord.x - static_cast<float>(ix)),
+                                     (srcCoord.y - static_cast<float>(iy)));
                     dst[dstCoord] = cuda::SaturateCast<SrcValueT>(out);
                 }
                 else
@@ -238,8 +240,8 @@ __global__ void RotatePlanarFusedTensorKernel(SrcWrapper src, DstWrapper dst, in
 
     const float  dst_x_shift = static_cast<float>(dst_x) - d_aCoeffs[2];
     const float  dst_y_shift = static_cast<float>(dst_y) - d_aCoeffs[5];
-    const float2 coord{dst_x_shift * d_aCoeffs[0] + dst_y_shift * (-d_aCoeffs[1]),
-                       dst_x_shift * (-d_aCoeffs[3]) + dst_y_shift * d_aCoeffs[4]};
+    const float2 coord{NVCV_CUDA_ADDMUL(dst_x_shift * d_aCoeffs[0], dst_y_shift, (-d_aCoeffs[1])),
+                       NVCV_CUDA_ADDMUL(dst_x_shift * (-d_aCoeffs[3]), dst_y_shift, d_aCoeffs[4])};
 
     if (coord.x > -0.5f && coord.x < static_cast<float>(srcSize.x) && coord.y > -0.5f
         && coord.y < static_cast<float>(srcSize.y))
@@ -381,8 +383,8 @@ __global__ void RotatePlanarFusedVarShapeKernel(SrcWrapper src, DstWrapper dst, 
     const float *d_aCoeffs   = (const float *)((char *)d_aCoeffs_ + (sizeof(float) * kAffineCoeffs) * batch_idx);
     const float  dst_x_shift = static_cast<float>(dst_x) - d_aCoeffs[2];
     const float  dst_y_shift = static_cast<float>(dst_y) - d_aCoeffs[5];
-    const float2 coord{dst_x_shift * d_aCoeffs[0] + dst_y_shift * (-d_aCoeffs[1]),
-                       dst_x_shift * (-d_aCoeffs[3]) + dst_y_shift * d_aCoeffs[4]};
+    const float2 coord{NVCV_CUDA_ADDMUL(dst_x_shift * d_aCoeffs[0], dst_y_shift, (-d_aCoeffs[1])),
+                       NVCV_CUDA_ADDMUL(dst_x_shift * (-d_aCoeffs[3]), dst_y_shift, d_aCoeffs[4])};
 
     const int width  = src.width(batch_idx);
     const int height = src.height(batch_idx);

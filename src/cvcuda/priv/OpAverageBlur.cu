@@ -139,7 +139,8 @@ inline __device__ void AccumulateBox(Work &res, const W &src, int x, int y, int 
 #pragma unroll
             for (int j = 0; j < KW; ++j)
             {
-                res = res + src[filter::SrcCoord<IsPlanar>(x - anchor.x + j, cy, plane, sample)] * kernelValue;
+                res = NVCV_CUDA_ADDMUL(res, (src[filter::SrcCoord<IsPlanar>(x - anchor.x + j, cy, plane, sample)]),
+                                       kernelValue);
             }
         }
     }
@@ -151,7 +152,8 @@ inline __device__ void AccumulateBox(Work &res, const W &src, int x, int y, int 
 
             for (int j = 0; j < kernelSize.x; ++j)
             {
-                res = res + src[filter::SrcCoord<IsPlanar>(x - anchor.x + j, cy, plane, sample)] * kernelValue;
+                res = NVCV_CUDA_ADDMUL(res, (src[filter::SrcCoord<IsPlanar>(x - anchor.x + j, cy, plane, sample)]),
+                                       kernelValue);
             }
         }
     }
@@ -319,7 +321,7 @@ __global__ void AverageBlur5x5X4(Border borderSrc, Raw src, Dst dst)
 #pragma unroll
             for (int k = 0; k < 4; ++k)
 #pragma unroll
-                for (int j = 0; j < 5; ++j) result[k] = result[k] + row[k + j] * weight;
+                for (int j = 0; j < 5; ++j) result[k] = NVCV_CUDA_ADDMUL(result[k], row[k + j], weight);
         }
 #pragma unroll
         for (int k = 0; k < 4; ++k) *dst.Ptr(sample, 0, y, x + k) = cuda::SaturateCast<T>(result[k]);

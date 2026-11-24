@@ -184,7 +184,7 @@ inline __device__ T CubicAccumulate(RowPtrOp rowPtr, float x, float y, StrideTyp
 #pragma unroll
             for (int k = 0; k < 4; ++k)
             {
-                sum += row[k] * (wx[k] * wy[r]);
+                NVCV_CUDA_MULACC(sum, row[k], (wx[k] * wy[r]));
             }
         }
         else
@@ -193,7 +193,7 @@ inline __device__ T CubicAccumulate(RowPtrOp rowPtr, float x, float y, StrideTyp
 #pragma unroll
             for (int k = 0; k < 4; ++k)
             {
-                sum += row[k] * (wx[k] * wy[r]);
+                NVCV_CUDA_MULACC(sum, row[k], (wx[k] * wy[r]));
             }
         }
     }
@@ -257,7 +257,7 @@ inline __device__ T CubicAccumulateBorder(RowPtrOp rowPtr, T borderValue, int2 s
             for (int k = 0; k < 4; ++k)
             {
                 const T v = xAsc ? row[k] : row[3 - k];
-                sum += v * (wx[k] * wy[r]);
+                NVCV_CUDA_MULACC(sum, v, (wx[k] * wy[r]));
             }
         }
     }
@@ -271,7 +271,7 @@ inline __device__ T CubicAccumulateBorder(RowPtrOp rowPtr, T borderValue, int2 s
             for (int k = 0; k < 4; ++k)
             {
                 const T v = (yin[r] && xin[k]) ? row[xr[k]] : borderValue;
-                sum += v * (wx[k] * wy[r]);
+                NVCV_CUDA_MULACC(sum, v, (wx[k] * wy[r]));
             }
         }
     }
@@ -386,7 +386,7 @@ inline __device__ void CubicWarpPlanes(RowPtrOp rowPtr, StoreOp store, const flo
 #pragma unroll
                 for (int k = 0; k < 4; ++k)
                 {
-                    sum += row[k] * (wx[k] * wy[r]);
+                    NVCV_CUDA_MULACC(sum, row[k], (wx[k] * wy[r]));
                 }
             }
             store(p, cuda::SaturateCast<BT>(sum));
@@ -436,7 +436,7 @@ inline __device__ void CubicWarpPlanes(RowPtrOp rowPtr, StoreOp store, const flo
 #pragma unroll
                 for (int k = 0; k < 4; ++k)
                 {
-                    sum += (xAsc ? row[k] : row[3 - k]) * (wx[k] * wy[r]);
+                    NVCV_CUDA_MULACC(sum, (xAsc ? row[k] : row[3 - k]), (wx[k] * wy[r]));
                 }
             }
         }
@@ -450,7 +450,7 @@ inline __device__ void CubicWarpPlanes(RowPtrOp rowPtr, StoreOp store, const flo
                 for (int k = 0; k < 4; ++k)
                 {
                     const BT v = (yin[r] && xin[k]) ? row[xr[k]] : bval;
-                    sum += v * (wx[k] * wy[r]);
+                    NVCV_CUDA_MULACC(sum, v, (wx[k] * wy[r]));
                 }
             }
         }

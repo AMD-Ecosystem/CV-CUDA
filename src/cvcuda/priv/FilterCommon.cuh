@@ -402,7 +402,8 @@ __global__ void Filter2D(SrcWrapper src, Dst dst, Coefs coefs)
 
         for (int j = 0; j < kernelSize.x; ++j)
         {
-            res = res + src[SrcCoord<Dst::kPlanar>(x - anchor.x + j, cy, plane, batch_idx)] * coefs.At(batch_idx, i, j);
+            res = NVCV_CUDA_ADDMUL(res, (src[SrcCoord<Dst::kPlanar>(x - anchor.x + j, cy, plane, batch_idx)]),
+                                   (coefs.At(batch_idx, i, j)));
         }
     }
 
@@ -431,7 +432,8 @@ __device__ __forceinline__ void AccumulateTiled(const T *tile, const float *kern
                 window[Outputs - 1] = row[j + Outputs - 1];
                 const float k       = kernelTile[kInd++];
 #pragma unroll
-                for (int output = 0; output < Outputs; ++output) res[output] = res[output] + window[output] * k;
+                for (int output = 0; output < Outputs; ++output)
+                    res[output] = NVCV_CUDA_ADDMUL(res[output], window[output], k);
 #pragma unroll
                 for (int output = 0; output < Outputs - 1; ++output) window[output] = window[output + 1];
             }
@@ -445,7 +447,7 @@ __device__ __forceinline__ void AccumulateTiled(const T *tile, const float *kern
                 const float k     = kernelTile[kInd++];
 #pragma unroll
                 for (int output = 0; output < Outputs; ++output)
-                    res[output] = res[output] + tile[tileY * tileW + tileX + output] * k;
+                    res[output] = NVCV_CUDA_ADDMUL(res[output], tile[tileY * tileW + tileX + output], k);
             }
         }
     }
@@ -679,7 +681,7 @@ __global__ void Filter2DTiledFixed(SrcWrapper src, Dst dst, Coefs coefs)
 #pragma unroll
                 for (int output = 0; output < Outputs; ++output)
                 {
-                    res[output] = res[output] + tile[tileY * tileW + tileX + output] * k;
+                    res[output] = NVCV_CUDA_ADDMUL(res[output], tile[tileY * tileW + tileX + output], k);
                 }
             }
         }
@@ -730,7 +732,8 @@ __global__ void Filter2DPlanar(SrcWrapper src, Dst dst, Coefs coefs, int channel
 
             for (int j = 0; j < kernelSize.x; ++j)
             {
-                res = res + src[int4{x - anchor.x + j, cy, plane, batch_idx}] * coefs.At(batch_idx, i, j);
+                res = NVCV_CUDA_ADDMUL(res, (src[int4{x - anchor.x + j, cy, plane, batch_idx}]),
+                                       (coefs.At(batch_idx, i, j)));
             }
         }
 
