@@ -630,7 +630,8 @@ __global__ void horizontal_pass(const SrcPtr2d src, DstPtr2d dst, NVCVRectI roi,
                 accum_t          h_ss = cuda::SetAll<accum_t>(work_type{0});
                 for (int x = 0; x < xmax; ++x)
                 {
-                    h_ss = h_ss + h_k[x] * cuda::StaticCast<work_type>(*reinterpret_cast<const vec_t *>(p));
+                    h_ss = NVCV_CUDA_ADDMUL(h_ss, h_k[x],
+                                            cuda::StaticCast<work_type>(*reinterpret_cast<const vec_t *>(p)));
                     p += sizeof(vec_t);
                 }
 
@@ -656,7 +657,7 @@ __global__ void horizontal_pass(const SrcPtr2d src, DstPtr2d dst, NVCVRectI roi,
                     work_type h_ss = 0.0;
                     for (int x = 0; x < xmax; ++x)
                     {
-                        h_ss = h_ss + *src.ptr(batch_idx, dst_y, x + xmin, c) * h_k[x];
+                        h_ss = NVCV_CUDA_ADDMUL(h_ss, (*src.ptr(batch_idx, dst_y, x + xmin, c)), h_k[x]);
                     }
 
                     if (round_up)
@@ -718,25 +719,23 @@ __global__ void horizontal_pass_paired(const SrcPtr2d src, DstPtr2d dst, NVCVRec
         const int        preEnd = min(xmin1, end0);
         for (int x = xmin0; x < preEnd; ++x)
         {
-            s0 = s0
-               + k0[x - xmin0]
-                     * cuda::StaticCast<work_type>(
-                         *reinterpret_cast<const vec_t *>(base + static_cast<size_t>(x) * sizeof(vec_t)));
+            s0 = NVCV_CUDA_ADDMUL(s0, k0[x - xmin0],
+                                  cuda::StaticCast<work_type>(
+                                      *reinterpret_cast<const vec_t *>(base + static_cast<size_t>(x) * sizeof(vec_t))));
         }
         for (int x = xmin1; x < end0; ++x)
         {
             const accum_t px = cuda::StaticCast<work_type>(
                 *reinterpret_cast<const vec_t *>(base + static_cast<size_t>(x) * sizeof(vec_t)));
-            s0 = s0 + k0[x - xmin0] * px;
-            s1 = s1 + k1[x - xmin1] * px;
+            s0 = NVCV_CUDA_ADDMUL(s0, k0[x - xmin0], px);
+            s1 = NVCV_CUDA_ADDMUL(s1, k1[x - xmin1], px);
         }
         const int sufBegin = max(xmin1, end0);
         for (int x = sufBegin; x < end1; ++x)
         {
-            s1 = s1
-               + k1[x - xmin1]
-                     * cuda::StaticCast<work_type>(
-                         *reinterpret_cast<const vec_t *>(base + static_cast<size_t>(x) * sizeof(vec_t)));
+            s1 = NVCV_CUDA_ADDMUL(s1, k1[x - xmin1],
+                                  cuda::StaticCast<work_type>(
+                                      *reinterpret_cast<const vec_t *>(base + static_cast<size_t>(x) * sizeof(vec_t))));
         }
 
         vec_t *out0 = reinterpret_cast<vec_t *>(dst.ptr(batch_idx, dst_y, pair0, 0));
@@ -826,7 +825,7 @@ __global__ void horizontal_pass_planar_channels(const SrcPtr2d src, DstPtr2d dst
                         const work_type weight = h_k[0];
 #pragma unroll
                         for (int channel = 0; channel < PC; ++channel)
-                            h_ss[channel] = h_ss[channel] + row[channel][0] * weight;
+                            h_ss[channel] = NVCV_CUDA_ADDMUL(h_ss[channel], row[channel][0], weight);
                         tap = 1;
                     }
 #pragma unroll 2
@@ -853,7 +852,7 @@ __global__ void horizontal_pass_planar_channels(const SrcPtr2d src, DstPtr2d dst
                         const work_type weight = h_k[tap];
 #pragma unroll
                         for (int channel = 0; channel < PC; ++channel)
-                            h_ss[channel] = h_ss[channel] + row[channel][tap] * weight;
+                            h_ss[channel] = NVCV_CUDA_ADDMUL(h_ss[channel], row[channel][tap], weight);
                     }
                 }
                 else
@@ -863,7 +862,7 @@ __global__ void horizontal_pass_planar_channels(const SrcPtr2d src, DstPtr2d dst
                         const work_type weight = h_k[tap];
 #pragma unroll
                         for (int channel = 0; channel < PC; ++channel)
-                            h_ss[channel] = h_ss[channel] + row[channel][tap] * weight;
+                            h_ss[channel] = NVCV_CUDA_ADDMUL(h_ss[channel], row[channel][tap], weight);
                     }
                 }
             }
@@ -875,7 +874,7 @@ __global__ void horizontal_pass_planar_channels(const SrcPtr2d src, DstPtr2d dst
 #pragma unroll
                     for (int c = 0; c < PC; ++c)
                     {
-                        h_ss[c] = h_ss[c] + *src.ptr(batch_idx, dst_y, x + xmin, c) * k;
+                        h_ss[c] = NVCV_CUDA_ADDMUL(h_ss[c], (*src.ptr(batch_idx, dst_y, x + xmin, c)), k);
                     }
                 }
             }
@@ -926,7 +925,7 @@ __global__ void vertical_pass(const SrcPtr2d src, DstPtr2d dst, NVCVRectI roi, F
             accum_t          ss = cuda::SetAll<accum_t>(init_buffer);
             for (int y = 0; y < ymax; ++y)
             {
-                ss = ss + v_k[y] * cuda::StaticCast<work_type>(*reinterpret_cast<const vec_t *>(p));
+                ss = NVCV_CUDA_ADDMUL(ss, v_k[y], cuda::StaticCast<work_type>(*reinterpret_cast<const vec_t *>(p)));
                 p += src.rowStride;
             }
 
@@ -949,7 +948,7 @@ __global__ void vertical_pass(const SrcPtr2d src, DstPtr2d dst, NVCVRectI roi, F
                 work_type ss = init_buffer;
                 for (int y = 0; y < ymax; ++y)
                 {
-                    ss = ss + *src.ptr(batch_idx, y + ymin, dst_x, c) * v_k[y];
+                    ss = NVCV_CUDA_ADDMUL(ss, (*src.ptr(batch_idx, y + ymin, dst_x, c)), v_k[y]);
                 }
 
                 if (round_up)
@@ -996,7 +995,7 @@ struct PillowSpanAccum
     inline __device__ void tap(work_type k, const pack_type &px)
     {
 #pragma unroll
-        for (int g = 0; g < kGroups; ++g) s[g] = s[g] + k * nvcv::cuda::StaticCast<work_type>(px.v[g]);
+        for (int g = 0; g < kGroups; ++g) s[g] = NVCV_CUDA_ADDMUL(s[g], k, nvcv::cuda::StaticCast<work_type>(px.v[g]));
     }
 
     inline __device__ void store(T *dst, bool round_up) const
@@ -1073,7 +1072,8 @@ __global__ void vertical_pass_vec(const SrcPtr2d src, DstPtr2d dst, NVCVRectI ro
                 accum_t ss = cuda::SetAll<accum_t>(init_buffer);
                 for (int y = 0; y < ymax; ++y)
                 {
-                    ss = ss + v_k[y] * cuda::StaticCast<work_type>(*reinterpret_cast<const vec_t *>(src_row));
+                    ss = NVCV_CUDA_ADDMUL(ss, v_k[y],
+                                          cuda::StaticCast<work_type>(*reinterpret_cast<const vec_t *>(src_row)));
                     src_row += src.rowStride;
                 }
                 if (round_up)
@@ -1100,7 +1100,7 @@ __global__ void vertical_pass_vec(const SrcPtr2d src, DstPtr2d dst, NVCVRectI ro
                 work_type        ss = init_buffer;
                 for (int y = 0; y < ymax; ++y)
                 {
-                    ss = ss + *reinterpret_cast<const T *>(p) * v_k[y];
+                    ss = NVCV_CUDA_ADDMUL(ss, *reinterpret_cast<const T *>(p), v_k[y]);
                     p += src.rowStride;
                 }
                 dst_row[i] = round_up ? cuda::SaturateCast<T>(std::round(ss)) : cuda::SaturateCast<T>(ss);
@@ -1213,10 +1213,10 @@ __global__ void fused_pass(const SrcPtr2d src, DstPtr2d dst, NVCVRectI roi, Filt
         accum_t          inner = cuda::SetAll<accum_t>(work_type{0});
         for (int x = 0; x < xmax; ++x)
         {
-            inner = inner + h_k[x] * cuda::StaticCast<work_type>(*reinterpret_cast<const vec_t *>(p));
+            inner = NVCV_CUDA_ADDMUL(inner, h_k[x], cuda::StaticCast<work_type>(*reinterpret_cast<const vec_t *>(p)));
             p += sizeof(vec_t);
         }
-        ss = ss + v_k[y] * inner;
+        ss = NVCV_CUDA_ADDMUL(ss, v_k[y], inner);
     }
 
     vec_t *out = reinterpret_cast<vec_t *>(dst.ptr(batch_idx, dst_y, dst_x, 0));
@@ -1297,11 +1297,11 @@ __device__ void fused_planar_body(const SrcPtr2d src, DstPtr2d dst, NVCVRectI ro
         {
             const work_type k = h_k[x];
 #pragma unroll
-            for (int c = 0; c < PC; ++c) inner[c] = inner[c] + row[c][x] * k;
+            for (int c = 0; c < PC; ++c) inner[c] = NVCV_CUDA_ADDMUL(inner[c], row[c][x], k);
         }
         const work_type vk = v_k[y];
 #pragma unroll
-        for (int c = 0; c < PC; ++c) ss[c] = ss[c] + vk * inner[c];
+        for (int c = 0; c < PC; ++c) ss[c] = NVCV_CUDA_ADDMUL(ss[c], vk, inner[c]);
     }
 
 #pragma unroll
@@ -1384,7 +1384,8 @@ __global__ void vertical_pass_planar_vec(const SrcPtr2d src, DstPtr2d dst, NVCVR
                     accum_t          ss = cuda::SetAll<accum_t>(init_buffer);
                     for (int y = 0; y < ymax; ++y)
                     {
-                        ss = ss + v_k[y] * cuda::StaticCast<work_type>(*reinterpret_cast<const vec_t *>(p));
+                        ss = NVCV_CUDA_ADDMUL(ss, v_k[y],
+                                              cuda::StaticCast<work_type>(*reinterpret_cast<const vec_t *>(p)));
                         p += src.rowStride;
                     }
 
@@ -1416,7 +1417,7 @@ __global__ void vertical_pass_planar_vec(const SrcPtr2d src, DstPtr2d dst, NVCVR
                     work_type ss    = init_buffer;
                     for (int y = 0; y < ymax; ++y)
                     {
-                        ss = ss + *src.ptr(batch_idx, y + ymin, dst_x, c) * v_k[y];
+                        ss = NVCV_CUDA_ADDMUL(ss, (*src.ptr(batch_idx, y + ymin, dst_x, c)), v_k[y]);
                     }
 
                     if (round_up)
@@ -1517,7 +1518,7 @@ __global__ void vertical_pass_planar_vec_paired(const SrcPtr2d src, DstPtr2d dst
                     work_type ss    = init_buffer;
                     for (int y = 0; y < ymax0; ++y)
                     {
-                        ss = ss + *src.ptr(batch_idx, y + ymin0, dst_x, c) * k0[y];
+                        ss = NVCV_CUDA_ADDMUL(ss, (*src.ptr(batch_idx, y + ymin0, dst_x, c)), k0[y]);
                     }
                     if (round_up)
                         *dst.ptr(batch_idx, row0, dst_x, c) = cuda::SaturateCast<T>(std::round(ss));
@@ -1529,7 +1530,7 @@ __global__ void vertical_pass_planar_vec_paired(const SrcPtr2d src, DstPtr2d dst
                         work_type st = init_buffer;
                         for (int y = 0; y < ymax1; ++y)
                         {
-                            st = st + *src.ptr(batch_idx, y + ymin1, dst_x, c) * k1[y];
+                            st = NVCV_CUDA_ADDMUL(st, (*src.ptr(batch_idx, y + ymin1, dst_x, c)), k1[y]);
                         }
                         if (round_up)
                             *dst.ptr(batch_idx, row0 + 1, dst_x, c) = cuda::SaturateCast<T>(std::round(st));
@@ -2062,7 +2063,8 @@ __global__ void horizontal_pass_var_shape(const cuda::ImageBatchVarShapeWrapNHWC
                     const std::byte *p = reinterpret_cast<const std::byte *>(src.ptr(batch_idx, dst_y, xmin, 0));
                     for (int x = 0; x < xmax; ++x)
                     {
-                        h_ss = h_ss + h_k[x] * cuda::StaticCast<work_type>(*reinterpret_cast<const vin_t *>(p));
+                        h_ss = NVCV_CUDA_ADDMUL(h_ss, h_k[x],
+                                                cuda::StaticCast<work_type>(*reinterpret_cast<const vin_t *>(p)));
                         p += sizeof(vin_t);
                     }
                 }
@@ -2091,7 +2093,7 @@ __global__ void horizontal_pass_var_shape(const cuda::ImageBatchVarShapeWrapNHWC
                     const std::byte *p = reinterpret_cast<const std::byte *>(src.ptr(batch_idx, dst_y, xmin, c));
                     for (int x = 0; x < xmax; ++x)
                     {
-                        h_ss = h_ss + *reinterpret_cast<const T1 *>(p) * h_k[x];
+                        h_ss = NVCV_CUDA_ADDMUL(h_ss, *reinterpret_cast<const T1 *>(p), h_k[x]);
                         p += src.numChannels() * sizeof(T1);
                     }
                 }
@@ -2168,25 +2170,23 @@ __global__ void horizontal_pass_var_shape_paired(const cuda::ImageBatchVarShapeW
                 const int        preEnd = min(xmin1, end0);
                 for (int x = xmin0; x < preEnd; ++x)
                 {
-                    s0 = s0
-                       + k0[x - xmin0]
-                             * cuda::StaticCast<work_type>(
-                                 *reinterpret_cast<const vin_t *>(base + static_cast<size_t>(x) * sizeof(vin_t)));
+                    s0 = NVCV_CUDA_ADDMUL(s0, k0[x - xmin0],
+                                          cuda::StaticCast<work_type>(*reinterpret_cast<const vin_t *>(
+                                              base + static_cast<size_t>(x) * sizeof(vin_t))));
                 }
                 for (int x = xmin1; x < end0; ++x)
                 {
                     const accum_t px = cuda::StaticCast<work_type>(
                         *reinterpret_cast<const vin_t *>(base + static_cast<size_t>(x) * sizeof(vin_t)));
-                    s0 = s0 + k0[x - xmin0] * px;
-                    s1 = s1 + k1[x - xmin1] * px;
+                    s0 = NVCV_CUDA_ADDMUL(s0, k0[x - xmin0], px);
+                    s1 = NVCV_CUDA_ADDMUL(s1, k1[x - xmin1], px);
                 }
                 const int sufBegin = max(xmin1, end0);
                 for (int x = sufBegin; x < end1; ++x)
                 {
-                    s1 = s1
-                       + k1[x - xmin1]
-                             * cuda::StaticCast<work_type>(
-                                 *reinterpret_cast<const vin_t *>(base + static_cast<size_t>(x) * sizeof(vin_t)));
+                    s1 = NVCV_CUDA_ADDMUL(s1, k1[x - xmin1],
+                                          cuda::StaticCast<work_type>(*reinterpret_cast<const vin_t *>(
+                                              base + static_cast<size_t>(x) * sizeof(vin_t))));
                 }
             }
             vout_t *out0 = reinterpret_cast<vout_t *>(dst.ptr(batch_idx, dst_y, pair0, 0));
@@ -2233,7 +2233,7 @@ __global__ void horizontal_pass_var_shape_paired(const cuda::ImageBatchVarShapeW
                         const std::byte *p = reinterpret_cast<const std::byte *>(src.ptr(batch_idx, dst_y, xmin, c));
                         for (int x = 0; x < xmax; ++x)
                         {
-                            h_ss = h_ss + *reinterpret_cast<const T1 *>(p) * hk[x];
+                            h_ss = NVCV_CUDA_ADDMUL(h_ss, *reinterpret_cast<const T1 *>(p), hk[x]);
                             p += src.numChannels() * sizeof(T1);
                         }
                     }
@@ -2299,7 +2299,7 @@ __global__ void vertical_pass_var_shape(const InterleavedPtr<T1> src, cuda::Imag
                 accum_t          ss = cuda::SetAll<accum_t>(init_buffer);
                 for (int y = 0; y < ymax; ++y)
                 {
-                    ss = ss + v_k[y] * cuda::StaticCast<work_type>(*reinterpret_cast<const vin_t *>(p));
+                    ss = NVCV_CUDA_ADDMUL(ss, v_k[y], cuda::StaticCast<work_type>(*reinterpret_cast<const vin_t *>(p)));
                     p += src.rowStride;
                 }
                 vout_t *out = reinterpret_cast<vout_t *>(dst.ptr(batch_idx, dst_y, dst_x, 0));
@@ -2325,7 +2325,7 @@ __global__ void vertical_pass_var_shape(const InterleavedPtr<T1> src, cuda::Imag
                 work_type        ss = init_buffer;
                 for (int y = 0; y < ymax; ++y)
                 {
-                    ss = ss + *reinterpret_cast<const T1 *>(p) * v_k[y];
+                    ss = NVCV_CUDA_ADDMUL(ss, *reinterpret_cast<const T1 *>(p), v_k[y]);
                     p += src.rowStride;
                 }
 
@@ -2389,7 +2389,8 @@ __global__ void vertical_pass_var_shape_vec(const InterleavedPtr<T1> src, cuda::
             accum_t ss = cuda::SetAll<accum_t>(init_buffer);
             for (int y = 0; y < ymax; ++y)
             {
-                ss = ss + v_k[y] * cuda::StaticCast<work_type>(*reinterpret_cast<const vin_t *>(src_row));
+                ss = NVCV_CUDA_ADDMUL(ss, v_k[y],
+                                      cuda::StaticCast<work_type>(*reinterpret_cast<const vin_t *>(src_row)));
                 src_row += src.rowStride;
             }
             if (round_up)
@@ -2411,7 +2412,7 @@ __global__ void vertical_pass_var_shape_vec(const InterleavedPtr<T1> src, cuda::
                 work_type        ss = init_buffer;
                 for (int y = 0; y < ymax; ++y)
                 {
-                    ss = ss + *reinterpret_cast<const T1 *>(p) * v_k[y];
+                    ss = NVCV_CUDA_ADDMUL(ss, *reinterpret_cast<const T1 *>(p), v_k[y]);
                     p += src.rowStride;
                 }
                 dst_row[i] = round_up ? cuda::SaturateCast<T2>(std::round(ss)) : cuda::SaturateCast<T2>(ss);
@@ -2483,10 +2484,11 @@ __global__ void fused_pass_var_shape(const cuda::ImageBatchVarShapeWrapNHWC<T> s
             accum_t          inner = cuda::SetAll<accum_t>(work_type{0});
             for (int x = 0; x < xmax; ++x)
             {
-                inner = inner + h_k[x] * cuda::StaticCast<work_type>(*reinterpret_cast<const vin_t *>(p));
+                inner
+                    = NVCV_CUDA_ADDMUL(inner, h_k[x], cuda::StaticCast<work_type>(*reinterpret_cast<const vin_t *>(p)));
                 p += sizeof(vin_t);
             }
-            ss = ss + v_k[y] * inner;
+            ss = NVCV_CUDA_ADDMUL(ss, v_k[y], inner);
         }
         vin_t *out = reinterpret_cast<vin_t *>(dst.ptr(batch_idx, dst_y, dst_x, 0));
         if (round_up)
@@ -2511,10 +2513,10 @@ __global__ void fused_pass_var_shape(const cuda::ImageBatchVarShapeWrapNHWC<T> s
                 work_type        inner = 0;
                 for (int x = 0; x < xmax; ++x)
                 {
-                    inner = inner + *reinterpret_cast<const T *>(p) * h_k[x];
+                    inner = NVCV_CUDA_ADDMUL(inner, *reinterpret_cast<const T *>(p), h_k[x]);
                     p += src.numChannels() * sizeof(T);
                 }
-                ss = ss + v_k[y] * inner;
+                ss = NVCV_CUDA_ADDMUL(ss, v_k[y], inner);
             }
             if (round_up)
                 *dst.ptr(batch_idx, dst_y, dst_x, c) = cuda::SaturateCast<T>(std::round(ss));
@@ -2575,7 +2577,7 @@ __global__ void horizontal_pass_var_shape_planar(const cuda::ImageBatchVarShapeW
                 const T1 *row = src.ptr(batch_idx, plane, dst_y, xmin);
                 for (int x = 0; x < xmax; ++x)
                 {
-                    h_ss = h_ss + row[x] * h_k[x];
+                    h_ss = NVCV_CUDA_ADDMUL(h_ss, row[x], h_k[x]);
                 }
             }
             if (round_up)
@@ -2649,7 +2651,7 @@ __global__ void horizontal_pass_var_shape_planar_channels(const cuda::ImageBatch
 #pragma unroll
                     for (int plane = 0; plane < PC; ++plane)
                     {
-                        h_ss[plane] = h_ss[plane] + row[plane][tap] * coefficient;
+                        h_ss[plane] = NVCV_CUDA_ADDMUL(h_ss[plane], row[plane][tap], coefficient);
                     }
                 }
             }
@@ -2661,7 +2663,7 @@ __global__ void horizontal_pass_var_shape_planar_channels(const cuda::ImageBatch
 #pragma unroll
                     for (int plane = 0; plane < PC; ++plane)
                     {
-                        h_ss[plane] = h_ss[plane] + row[plane][x] * k;
+                        h_ss[plane] = NVCV_CUDA_ADDMUL(h_ss[plane], row[plane][x], k);
                     }
                 }
             }
@@ -2716,7 +2718,7 @@ __global__ void vertical_pass_var_shape_planar(const InterleavedPtr<T1> src, cud
             work_type        ss = init_buffer;
             for (int y = 0; y < ymax; ++y)
             {
-                ss = ss + *reinterpret_cast<const T1 *>(p) * v_k[y];
+                ss = NVCV_CUDA_ADDMUL(ss, *reinterpret_cast<const T1 *>(p), v_k[y]);
                 p += src.rowStride;
             }
 
@@ -2803,7 +2805,8 @@ __global__ CVCUDA_PILLOW_U8_TILE_BOUNDS void pillow_fused_u8_tile(
         {
 #pragma unroll
             for (int channel = 0; channel < 3; ++channel)
-                sums[channel] = sums[channel] + images.load(sample, sourceRow, firstTap + tap, channel) * weights[tap];
+                sums[channel] = NVCV_CUDA_ADDMUL(
+                    sums[channel], (images.load(sample, sourceRow, firstTap + tap, channel)), weights[tap]);
         }
 #pragma unroll
         for (int channel = 0; channel < 3; ++channel)
@@ -2824,7 +2827,7 @@ __global__ CVCUDA_PILLOW_U8_TILE_BOUNDS void pillow_fused_u8_tile(
             const int middle = ((firstTap + tap - firstRow) * tileWidth + index % tileWidth) * 3;
 #pragma unroll
             for (int channel = 0; channel < 3; ++channel)
-                sums[channel] = sums[channel] + intermediate[middle + channel] * weights[tap];
+                sums[channel] = NVCV_CUDA_ADDMUL(sums[channel], intermediate[middle + channel], weights[tap]);
         }
 #pragma unroll
         for (int channel = 0; channel < 3; ++channel)

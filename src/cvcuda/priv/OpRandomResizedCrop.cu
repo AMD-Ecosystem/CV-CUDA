@@ -329,9 +329,9 @@ __global__ void ResizeLinear(const SrcWrapper src, DstWrapper dst, const Geometr
         const T *aPtr = src.ptr(batch_idx, ty.s, 0);     // upper row
         const T *bPtr = src.ptr(batch_idx, ty.s + 1, 0); // lower row
 
-        *dst.ptr(batch_idx, dst_y, dst_x)
-            = cuda::SaturateCast<T>((1.0f - tx.f) * (aPtr[tx.s] * (1.0f - ty.f) + bPtr[tx.s] * ty.f)
-                                    + tx.f * (aPtr[tx.s + 1] * (1.0f - ty.f) + bPtr[tx.s + 1] * ty.f));
+        *dst.ptr(batch_idx, dst_y, dst_x) = cuda::SaturateCast<T>(
+            NVCV_CUDA_ADDMUL((1.0f - tx.f) * NVCV_CUDA_ADDMUL(aPtr[tx.s] * (1.0f - ty.f), bPtr[tx.s], ty.f), tx.f,
+                             NVCV_CUDA_ADDMUL(aPtr[tx.s + 1] * (1.0f - ty.f), bPtr[tx.s + 1], ty.f)));
     }
 }
 
@@ -386,10 +386,12 @@ __global__ void ResizeLinearPacked(const SrcWrapper src, DstWrapper dst, const G
                 const LinearTap tx = LinearSourceTap(dst_x, crop.scaleX, crop.left, srcSize.x);
 
                 dstPack[i] = cuda::SaturateCast<T>(
-                    (1.0f - tx.f) * (LinearPixelValue(aPtr[tx.s]) * (1.0f - ty.f) + LinearPixelValue(bPtr[tx.s]) * ty.f)
-                    + tx.f
-                          * (LinearPixelValue(aPtr[tx.s + 1]) * (1.0f - ty.f)
-                             + LinearPixelValue(bPtr[tx.s + 1]) * ty.f));
+                    NVCV_CUDA_ADDMUL((1.0f - tx.f)
+                                         * NVCV_CUDA_ADDMUL(LinearPixelValue(aPtr[tx.s]) * (1.0f - ty.f),
+                                                            LinearPixelValue(bPtr[tx.s]), ty.f),
+                                     tx.f,
+                                     NVCV_CUDA_ADDMUL(LinearPixelValue(aPtr[tx.s + 1]) * (1.0f - ty.f),
+                                                      LinearPixelValue(bPtr[tx.s + 1]), ty.f)));
             }
         }
 
@@ -482,7 +484,7 @@ __global__ void ResizeCubic(const SrcWrapper src, DstWrapper dst, const Geometry
 #pragma unroll
                 for (int kx = 0; kx < 4; ++kx)
                 {
-                    accum += cY[ky] * cX[kx] * srcRow[csx[kx]];
+                    NVCV_CUDA_MULACC(accum, cY[ky] * cX[kx], srcRow[csx[kx]]);
                 }
             }
         }
@@ -496,7 +498,7 @@ __global__ void ResizeCubic(const SrcWrapper src, DstWrapper dst, const Geometry
                 for (int kx = 0; kx < 4; ++kx)
                 {
                     int csx = cuda::clamp(sx + kx - 1, 0, srcSize.x - 1);
-                    accum += cY[ky] * cX[kx] * *src.ptr(batch_idx, csy, csx);
+                    NVCV_CUDA_MULACC(accum, cY[ky] * cX[kx], (*src.ptr(batch_idx, csy, csx)));
                 }
             }
         }
@@ -534,9 +536,9 @@ __global__ void ResizeLinearPlanar(const SrcWrapper src, DstWrapper dst, const G
             const T *aPtr = src.ptr(batch_idx, plane, ty.s, 0);
             const T *bPtr = src.ptr(batch_idx, plane, ty.s + 1, 0);
 
-            *dst.ptr(batch_idx, plane, dst_y, dst_x)
-                = cuda::SaturateCast<T>((1.0f - tx.f) * (aPtr[tx.s] * (1.0f - ty.f) + bPtr[tx.s] * ty.f)
-                                        + tx.f * (aPtr[tx.s + 1] * (1.0f - ty.f) + bPtr[tx.s + 1] * ty.f));
+            *dst.ptr(batch_idx, plane, dst_y, dst_x) = cuda::SaturateCast<T>(
+                NVCV_CUDA_ADDMUL((1.0f - tx.f) * NVCV_CUDA_ADDMUL(aPtr[tx.s] * (1.0f - ty.f), bPtr[tx.s], ty.f), tx.f,
+                                 NVCV_CUDA_ADDMUL(aPtr[tx.s + 1] * (1.0f - ty.f), bPtr[tx.s + 1], ty.f)));
         }
     }
 }
@@ -610,19 +612,19 @@ __global__ void ResizeLinearPlanarStrided(const SrcWrapper src, DstWrapper dst, 
                 if constexpr (std::is_same_v<Geometry, VarShapeGeometry>)
                 {
                     T *outputPixel = outputColumns + i * static_cast<int>(blockDim.x);
-                    *outputPixel   = cuda::SaturateCast<T>(
-                        (1.0f - tx[i].f) * (aPtr[tx[i].s] * (1.0f - ty.f) + bPtr[tx[i].s] * ty.f)
-                        + tx[i].f * (aPtr[tx[i].s + 1] * (1.0f - ty.f) + bPtr[tx[i].s + 1] * ty.f));
+                    *outputPixel   = cuda::SaturateCast<T>(NVCV_CUDA_ADDMUL(
+                          (1.0f - tx[i].f) * NVCV_CUDA_ADDMUL(aPtr[tx[i].s] * (1.0f - ty.f), bPtr[tx[i].s], ty.f),
+                          tx[i].f, NVCV_CUDA_ADDMUL(aPtr[tx[i].s + 1] * (1.0f - ty.f), bPtr[tx[i].s + 1], ty.f)));
                 }
                 else
                 {
-                    *dst.ptr(batch_idx, plane, dst_y, dx[i]) = cuda::SaturateCast<T>(
+                    *dst.ptr(batch_idx, plane, dst_y, dx[i]) = cuda::SaturateCast<T>(NVCV_CUDA_ADDMUL(
                         (1.0f - tx[i].f)
-                            * (LinearPlanarInputValue<Geometry>(aPtr[tx[i].s]) * (1.0f - ty.f)
-                               + LinearPlanarInputValue<Geometry>(bPtr[tx[i].s]) * ty.f)
-                        + tx[i].f
-                              * (LinearPlanarInputValue<Geometry>(aPtr[tx[i].s + 1]) * (1.0f - ty.f)
-                                 + LinearPlanarInputValue<Geometry>(bPtr[tx[i].s + 1]) * ty.f));
+                            * NVCV_CUDA_ADDMUL(LinearPlanarInputValue<Geometry>(aPtr[tx[i].s]) * (1.0f - ty.f),
+                                               LinearPlanarInputValue<Geometry>(bPtr[tx[i].s]), ty.f),
+                        tx[i].f,
+                        NVCV_CUDA_ADDMUL(LinearPlanarInputValue<Geometry>(aPtr[tx[i].s + 1]) * (1.0f - ty.f),
+                                         LinearPlanarInputValue<Geometry>(bPtr[tx[i].s + 1]), ty.f)));
                 }
             }
         }
@@ -700,7 +702,7 @@ __global__ void ResizeCubicPlanar(const SrcWrapper src, DstWrapper dst, const Ge
 #pragma unroll
                 for (int kx = 0; kx < 4; ++kx)
                 {
-                    accum += cY[ky] * cX[kx] * *src.ptr(batch_idx, plane, csy[ky], csx[kx]);
+                    NVCV_CUDA_MULACC(accum, cY[ky] * cX[kx], (*src.ptr(batch_idx, plane, csy[ky], csx[kx])));
                 }
             }
 

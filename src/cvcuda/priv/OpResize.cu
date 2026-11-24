@@ -227,8 +227,10 @@ __device__ __forceinline__ T LinearReadMaybe(SrcWrapper src, const T *srcRow, in
 template<typename T>
 __device__ __forceinline__ T LinearBlend(T p00, T p10, T p01, T p11, float2 w)
 {
-    return cuda::SaturateCast<T>(p00 * ((1.f - w.x) * (1.f - w.y)) + p10 * (w.x * (1.f - w.y))
-                                 + p01 * ((1.f - w.x) * w.y) + p11 * (w.x * w.y));
+    return cuda::SaturateCast<T>(
+        NVCV_CUDA_ADDMUL(NVCV_CUDA_ADDMUL(NVCV_CUDA_ADDMUL(p00 * ((1.f - w.x) * (1.f - w.y)), p10, (w.x * (1.f - w.y))),
+                                          p01, ((1.f - w.x) * w.y)),
+                         p11, (w.x * w.y)));
 }
 
 // Blend from the float-cached INTERSECT pack: the expression tree matches LinearBlend exactly and
@@ -236,8 +238,10 @@ __device__ __forceinline__ T LinearBlend(T p00, T p10, T p01, T p11, float2 w)
 template<typename T>
 __device__ __forceinline__ T LinearBlendPack(const LinearFT<T> (&p)[4], float2 w)
 {
-    return cuda::SaturateCast<T>(p[0] * ((1.f - w.x) * (1.f - w.y)) + p[1] * (w.x * (1.f - w.y))
-                                 + p[2] * ((1.f - w.x) * w.y) + p[3] * (w.x * w.y));
+    return cuda::SaturateCast<T>(NVCV_CUDA_ADDMUL(
+        NVCV_CUDA_ADDMUL(NVCV_CUDA_ADDMUL(p[0] * ((1.f - w.x) * (1.f - w.y)), p[1], (w.x * (1.f - w.y))), p[2],
+                         ((1.f - w.x) * w.y)),
+        p[3], (w.x * w.y)));
 }
 
 template<bool USE_ROW_PTR, class SrcWrapper, typename T>
@@ -775,7 +779,7 @@ __global__ void CubicResizeSharedExpand(SrcWrapper src, DstWrapper dst, int2 src
         for (int cx = 0; cx < 4; cx++)
         {
             const int ii = (iSrcX + cx - 1) - tx0;
-            sum += tile[jj * tileW + ii] * (wx[cx] * wy[cy]);
+            NVCV_CUDA_MULACC(sum, tile[jj * tileW + ii], (wx[cx] * wy[cy]));
         }
     }
     dst[int3{dstX, dstY, z}] = cuda::SaturateCast<T>(sum);
@@ -886,7 +890,7 @@ __global__ void CubicResizeUpscaleRows(SrcWrapper src, DstWrapper dst, int2 srcS
         for (int cy = 0; cy < 4; ++cy)
         {
 #pragma unroll
-            for (int cx = 0; cx < 4; ++cx) sum0 += win[cy][cx] * (wx[cx] * wy0[cy]);
+            for (int cx = 0; cx < 4; ++cx) NVCV_CUDA_MULACC(sum0, win[cy][cx], (wx[cx] * wy0[cy]));
         }
 
         if constexpr (ROWS == 2)
@@ -897,7 +901,7 @@ __global__ void CubicResizeUpscaleRows(SrcWrapper src, DstWrapper dst, int2 srcS
                 for (int cy = 0; cy < 4; ++cy)
                 {
 #pragma unroll
-                    for (int cx = 0; cx < 4; ++cx) sum1 += win[cy][cx] * (wx[cx] * wy1[cy]);
+                    for (int cx = 0; cx < 4; ++cx) NVCV_CUDA_MULACC(sum1, win[cy][cx], (wx[cx] * wy1[cy]));
                 }
             }
             else
@@ -906,7 +910,7 @@ __global__ void CubicResizeUpscaleRows(SrcWrapper src, DstWrapper dst, int2 srcS
                 for (int cy = 0; cy < 4; ++cy)
                 {
 #pragma unroll
-                    for (int cx = 0; cx < 4; ++cx) sum1 += win[cy + 1][cx] * (wx[cx] * wy1[cy]);
+                    for (int cx = 0; cx < 4; ++cx) NVCV_CUDA_MULACC(sum1, win[cy + 1][cx], (wx[cx] * wy1[cy]));
                 }
             }
         }
@@ -978,8 +982,8 @@ __global__ void CubicResizeExpand2xWide(SrcWrapper src, DstWrapper dst, int2 src
 #pragma unroll
         for (int cx = 0; cx < 4; ++cx)
         {
-            sum0 += win[cy][cx] * (wx[cx] * wyE[cy]);
-            sum1 += win[cy + 1][cx] * (wx[cx] * wyO[cy]);
+            NVCV_CUDA_MULACC(sum0, win[cy][cx], (wx[cx] * wyE[cy]));
+            NVCV_CUDA_MULACC(sum1, win[cy + 1][cx], (wx[cx] * wyO[cy]));
         }
     }
 
@@ -1072,8 +1076,8 @@ __device__ __forceinline__ void CubicExpand2xBody(SrcWrapper src, DstWrapper dst
 #pragma unroll
             for (int cx = 0; cx < 4; ++cx)
             {
-                sum0 += win[cy][cb + cx] * (wx[cx] * wyE[cy]);
-                sum1 += win[cy + 1][cb + cx] * (wx[cx] * wyO[cy]);
+                NVCV_CUDA_MULACC(sum0, win[cy][cb + cx], (wx[cx] * wyE[cy]));
+                NVCV_CUDA_MULACC(sum1, win[cy + 1][cb + cx], (wx[cx] * wyO[cy]));
             }
         }
         out0[i] = cuda::SaturateCast<T>(sum0);
@@ -1182,7 +1186,7 @@ __global__ void CubicResize(SrcWrapper src, DstWrapper dst, int2 srcSize, int2 d
             for (int cx = 0; cx < 4; cx++)
             {
                 int sx = cuda::clamp(iSrcX + cx - 1, 0, srcSize.x - 1);
-                sum += src[int3{sx, sy[cy], z}] * (wx[cx] * wy[cy]);
+                NVCV_CUDA_MULACC(sum, (src[int3{sx, sy[cy], z}]), (wx[cx] * wy[cy]));
             }
         }
 
@@ -1251,7 +1255,7 @@ __global__ void CubicResizePlanar(SrcWrapper src, DstWrapper dst, int2 srcSize, 
 #pragma unroll
                 for (int cx = 0; cx < 4; cx++)
                 {
-                    sum += src[int3{sx[cx], sy[cy], plane}] * w[cy][cx];
+                    NVCV_CUDA_MULACC(sum, (src[int3{sx[cx], sy[cy], plane}]), w[cy][cx]);
                 }
             }
             dst[int3{dstX, dstY, plane}] = cuda::SaturateCast<T>(sum);
@@ -1492,16 +1496,16 @@ __global__ void AreaResizeFractional(SrcWrapper src, DstWrapper dst, int2 srcSiz
                 for (int c = 0; c < kMaxC; ++c)
                 {
                     if (c < nC[j])
-                        acc[j] += row[sx1[j] + c] * scaleA[j];
+                        NVCV_CUDA_MULACC(acc[j], row[sx1[j] + c], scaleA[j]);
                 }
             }
 #pragma unroll
             for (int j = 0; j < GN; ++j)
             {
                 if (hasL[j])
-                    acc[j] += row[sx1[j] - 1] * (wL[j] * scaleA[j]);
+                    NVCV_CUDA_MULACC(acc[j], row[sx1[j] - 1], (wL[j] * scaleA[j]));
                 if (hasR[j])
-                    acc[j] += row[sx2[j]] * (wR[j] * scaleA[j]);
+                    NVCV_CUDA_MULACC(acc[j], row[sx2[j]], (wR[j] * scaleA[j]));
             }
         }
 
@@ -1515,12 +1519,12 @@ __global__ void AreaResizeFractional(SrcWrapper src, DstWrapper dst, int2 srcSiz
                 for (int c = 0; c < kMaxC; ++c)
                 {
                     if (c < nC[j])
-                        acc[j] += row[sx1[j] + c] * (wTop * scaleA[j]);
+                        NVCV_CUDA_MULACC(acc[j], row[sx1[j] + c], (wTop * scaleA[j]));
                 }
                 if (hasL[j])
-                    acc[j] += row[sx1[j] - 1] * (wTop * wL[j] * scaleA[j]);
+                    NVCV_CUDA_MULACC(acc[j], row[sx1[j] - 1], (wTop * wL[j] * scaleA[j]));
                 if (hasR[j])
-                    acc[j] += row[sx2[j]] * (wTop * wR[j] * scaleA[j]);
+                    NVCV_CUDA_MULACC(acc[j], row[sx2[j]], (wTop * wR[j] * scaleA[j]));
             }
         }
 
@@ -1534,12 +1538,12 @@ __global__ void AreaResizeFractional(SrcWrapper src, DstWrapper dst, int2 srcSiz
                 for (int c = 0; c < kMaxC; ++c)
                 {
                     if (c < nC[j])
-                        acc[j] += row[sx1[j] + c] * (wBot * scaleA[j]);
+                        NVCV_CUDA_MULACC(acc[j], row[sx1[j] + c], (wBot * scaleA[j]));
                 }
                 if (hasR[j])
-                    acc[j] += row[sx2[j]] * (wBot * wR[j] * scaleA[j]);
+                    NVCV_CUDA_MULACC(acc[j], row[sx2[j]], (wBot * wR[j] * scaleA[j]));
                 if (hasL[j])
-                    acc[j] += row[sx1[j] - 1] * (wBot * wL[j] * scaleA[j]);
+                    NVCV_CUDA_MULACC(acc[j], row[sx1[j] - 1], (wBot * wL[j] * scaleA[j]));
             }
         }
 
@@ -2044,9 +2048,9 @@ __global__ void resize_bilinear(cuda::ImageBatchVarShapeWrap<const T> src, cuda:
         fx = ((sx < 0) ? 0 : ((sx > width - 2) ? 1 : fx - sx));
         sx = cuda::max(0, cuda::min(sx, width - 2));
 
-        *dst.ptr(batch_idx, 0, dst_y, dst_x)
-            = cuda::SaturateCast<T>((1.0f - fx) * (aPtr[sx] * (1.0f - fy) + bPtr[sx] * fy)
-                                    + fx * (aPtr[sx + 1] * (1.0f - fy) + bPtr[sx + 1] * fy));
+        *dst.ptr(batch_idx, 0, dst_y, dst_x) = cuda::SaturateCast<T>(
+            NVCV_CUDA_ADDMUL((1.0f - fx) * NVCV_CUDA_ADDMUL(aPtr[sx] * (1.0f - fy), bPtr[sx], fy), fx,
+                             NVCV_CUDA_ADDMUL(aPtr[sx + 1] * (1.0f - fy), bPtr[sx + 1], fy)));
     }
 } //resize_bilinear
 
@@ -2107,10 +2111,12 @@ __global__ void resize_bilinear_expand2x(cuda::ImageBatchVarShapeWrap<const T> s
         const float fx  = (sx < 0) ? 0.f : ((sx > width - 2) ? 1.f : (odd ? 0.25f : 0.75f));
         const int   cb  = (i / 2) + (odd ? 1 : 0); // window column of the first x tap
 
-        out0[i] = cuda::SaturateCast<T>((1.0f - fx) * (win[0][cb] * (1.0f - fyE) + win[1][cb] * fyE)
-                                        + fx * (win[0][cb + 1] * (1.0f - fyE) + win[1][cb + 1] * fyE));
-        out1[i] = cuda::SaturateCast<T>((1.0f - fx) * (win[1][cb] * (1.0f - fyO) + win[2][cb] * fyO)
-                                        + fx * (win[1][cb + 1] * (1.0f - fyO) + win[2][cb + 1] * fyO));
+        out0[i] = cuda::SaturateCast<T>(
+            NVCV_CUDA_ADDMUL((1.0f - fx) * NVCV_CUDA_ADDMUL(win[0][cb] * (1.0f - fyE), win[1][cb], fyE), fx,
+                             NVCV_CUDA_ADDMUL(win[0][cb + 1] * (1.0f - fyE), win[1][cb + 1], fyE)));
+        out1[i] = cuda::SaturateCast<T>(
+            NVCV_CUDA_ADDMUL((1.0f - fx) * NVCV_CUDA_ADDMUL(win[1][cb] * (1.0f - fyO), win[2][cb], fyO), fx,
+                             NVCV_CUDA_ADDMUL(win[1][cb + 1] * (1.0f - fyO), win[2][cb + 1], fyO)));
     }
 
     const int validCount = cuda::min(NIX<T>, dstWidth - dst_x0);
@@ -2203,7 +2209,8 @@ __global__ void resize_bilinear_pack(cuda::ImageBatchVarShapeWrap<const T> src, 
         }
         prevSx = sx;
 
-        out[i] = cuda::SaturateCast<T>((1.0f - fx) * (a0 * (1.0f - fy) + b0 * fy) + fx * (a1 * (1.0f - fy) + b1 * fy));
+        out[i] = cuda::SaturateCast<T>(NVCV_CUDA_ADDMUL((1.0f - fx) * NVCV_CUDA_ADDMUL(a0 * (1.0f - fy), b0, fy), fx,
+                                                        NVCV_CUDA_ADDMUL(a1 * (1.0f - fy), b1, fy)));
     }
 
     T        *dstRow     = dst.ptr(batch_idx, 0, dst_y, 0);
@@ -2298,7 +2305,7 @@ __global__ void resize_bicubic(cuda::ImageBatchVarShapeWrap<const T> src, cuda::
             for (int col = 0; col < 4; ++col)
             {
                 int csx = cuda::clamp(sx + col - 1, 0, width - 1);
-                accum += cY[row] * cX[col] * rowPtr[row][csx];
+                NVCV_CUDA_MULACC(accum, cY[row] * cX[col], rowPtr[row][csx]);
             }
         } //for row
         *dst.ptr(batch_idx, 0, dst_y, dst_x) = cuda::SaturateCast<T>(accum);
@@ -2382,7 +2389,7 @@ __global__ void resize_bicubic_smem(cuda::ImageBatchVarShapeWrap<const T> src, c
             for (int col = 0; col < 4; ++col)
             {
                 const int ii = (sx + col - 1) - tx0;
-                accum += cY[row] * cX[col] * tile[jj * tileW + ii];
+                NVCV_CUDA_MULACC(accum, cY[row] * cX[col], tile[jj * tileW + ii]);
             }
         }
         *dst.ptr(b, 0, dst_y, dst_x) = cuda::SaturateCast<T>(accum);
@@ -2414,7 +2421,7 @@ __global__ void resize_bicubic_smem(cuda::ImageBatchVarShapeWrap<const T> src, c
             for (int col = 0; col < 4; ++col)
             {
                 const int csx = cuda::clamp(sx + col - 1, 0, width - 1);
-                accum += cY[row] * cX[col] * rowPtr[row][csx];
+                NVCV_CUDA_MULACC(accum, cY[row] * cX[col], rowPtr[row][csx]);
             }
         *dst.ptr(b, 0, dst_y, dst_x) = cuda::SaturateCast<T>(accum);
     }
@@ -2480,7 +2487,7 @@ __device__ __forceinline__ void resizeAreaPlane(const cuda::ImageBatchVarShapeWr
 
                 for (int dx = sx1; dx < sx2; ++dx)
                 {
-                    out = out + srcRow[dx] * scale;
+                    out = NVCV_CUDA_ADDMUL(out, srcRow[dx], scale);
                 }
             }
             *dst.ptr(batch_idx, plane, y, x) = cuda::SaturateCast<T>(out);
@@ -2522,19 +2529,19 @@ __device__ __forceinline__ void resizeAreaPlane(const cuda::ImageBatchVarShapeWr
 
             for (int dx = sx1; dx < sx2; ++dx)
             {
-                out = out + srcRow[dx] * scale;
+                out = NVCV_CUDA_ADDMUL(out, srcRow[dx], scale);
             }
 
             if (sx1 > fsx1)
             {
                 srcCoord.x = sx1 - 1;
-                out        = out + brd_src.value(srcCoord) * ((sx1 - fsx1) * scale);
+                out        = NVCV_CUDA_ADDMUL(out, brd_src.value(srcCoord), ((sx1 - fsx1) * scale));
             }
 
             if (sx2 < fsx2)
             {
                 srcCoord.x = sx2;
-                out        = out + brd_src.value(srcCoord) * ((fsx2 - sx2) * scale);
+                out        = NVCV_CUDA_ADDMUL(out, brd_src.value(srcCoord), ((fsx2 - sx2) * scale));
             }
         }
 
@@ -2544,7 +2551,7 @@ __device__ __forceinline__ void resizeAreaPlane(const cuda::ImageBatchVarShapeWr
             for (int dx = sx1; dx < sx2; ++dx)
             {
                 srcCoord.x = dx;
-                out        = out + brd_src.value(srcCoord) * ((sy1 - fsy1) * scale);
+                out        = NVCV_CUDA_ADDMUL(out, brd_src.value(srcCoord), ((sy1 - fsy1) * scale));
             }
         }
 
@@ -2554,7 +2561,7 @@ __device__ __forceinline__ void resizeAreaPlane(const cuda::ImageBatchVarShapeWr
             for (int dx = sx1; dx < sx2; ++dx)
             {
                 srcCoord.x = dx;
-                out        = out + brd_src.value(srcCoord) * ((fsy2 - sy2) * scale);
+                out        = NVCV_CUDA_ADDMUL(out, brd_src.value(srcCoord), ((fsy2 - sy2) * scale));
             }
         }
 
@@ -2562,28 +2569,28 @@ __device__ __forceinline__ void resizeAreaPlane(const cuda::ImageBatchVarShapeWr
         {
             srcCoord.y = (sy1 - 1);
             srcCoord.x = (sx1 - 1);
-            out        = out + brd_src.value(srcCoord) * ((sy1 - fsy1) * (sx1 - fsx1) * scale);
+            out        = NVCV_CUDA_ADDMUL(out, brd_src.value(srcCoord), ((sy1 - fsy1) * (sx1 - fsx1) * scale));
         }
 
         if ((sy1 > fsy1) && (sx2 < fsx2))
         {
             srcCoord.y = (sy1 - 1);
             srcCoord.x = sx2;
-            out        = out + brd_src.value(srcCoord) * ((sy1 - fsy1) * (fsx2 - sx2) * scale);
+            out        = NVCV_CUDA_ADDMUL(out, brd_src.value(srcCoord), ((sy1 - fsy1) * (fsx2 - sx2) * scale));
         }
 
         if ((sy2 < fsy2) && (sx2 < fsx2))
         {
             srcCoord.y = sy2;
             srcCoord.x = sx2;
-            out        = out + brd_src.value(srcCoord) * ((fsy2 - sy2) * (fsx2 - sx2) * scale);
+            out        = NVCV_CUDA_ADDMUL(out, brd_src.value(srcCoord), ((fsy2 - sy2) * (fsx2 - sx2) * scale));
         }
 
         if ((sy2 < fsy2) && (sx1 > fsx1))
         {
             srcCoord.y = sy2;
             srcCoord.x = sx1 - 1;
-            out        = out + brd_src.value(srcCoord) * ((fsy2 - sy2) * (sx1 - fsx1) * scale);
+            out        = NVCV_CUDA_ADDMUL(out, brd_src.value(srcCoord), ((fsy2 - sy2) * (sx1 - fsx1) * scale));
         }
 
         *dst.ptr(batch_idx, plane, y, x) = cuda::SaturateCast<T>(out);
@@ -2839,16 +2846,16 @@ __device__ __forceinline__ void ResizeAreaFractionalPackBody(cuda::ImageBatchVar
                 for (int c = 0; c < kMaxC; ++c)
                 {
                     if (c < nC[j])
-                        acc[j] = acc[j] + row[sx1[j] + c] * scaleA[j];
+                        acc[j] = NVCV_CUDA_ADDMUL(acc[j], row[sx1[j] + c], scaleA[j]);
                 }
             }
 #pragma unroll
             for (int j = 0; j < GN; ++j)
             {
                 if (hasL[j])
-                    acc[j] = acc[j] + row[sx1[j] - 1] * (wL[j] * scaleA[j]);
+                    acc[j] = NVCV_CUDA_ADDMUL(acc[j], row[sx1[j] - 1], (wL[j] * scaleA[j]));
                 if (hasR[j])
-                    acc[j] = acc[j] + row[sx2[j]] * (wR[j] * scaleA[j]);
+                    acc[j] = NVCV_CUDA_ADDMUL(acc[j], row[sx2[j]], (wR[j] * scaleA[j]));
             }
         }
 
@@ -2862,7 +2869,7 @@ __device__ __forceinline__ void ResizeAreaFractionalPackBody(cuda::ImageBatchVar
                 for (int c = 0; c < kMaxC; ++c)
                 {
                     if (c < nC[j])
-                        acc[j] = acc[j] + row[sx1[j] + c] * (wTop * scaleA[j]);
+                        acc[j] = NVCV_CUDA_ADDMUL(acc[j], row[sx1[j] + c], (wTop * scaleA[j]));
                 }
             }
         }
@@ -2876,7 +2883,7 @@ __device__ __forceinline__ void ResizeAreaFractionalPackBody(cuda::ImageBatchVar
                 for (int c = 0; c < kMaxC; ++c)
                 {
                     if (c < nC[j])
-                        acc[j] = acc[j] + row[sx1[j] + c] * (wBot * scaleA[j]);
+                        acc[j] = NVCV_CUDA_ADDMUL(acc[j], row[sx1[j] + c], (wBot * scaleA[j]));
                 }
             }
         }
@@ -2884,13 +2891,16 @@ __device__ __forceinline__ void ResizeAreaFractionalPackBody(cuda::ImageBatchVar
         for (int j = 0; j < GN; ++j)
         {
             if (hasTop && hasL[j])
-                acc[j] = acc[j] + src.ptr(batch_idx, 0, sy1 - 1, 0)[sx1[j] - 1] * (wTop * wL[j] * scaleA[j]);
+                acc[j] = NVCV_CUDA_ADDMUL(acc[j], (src.ptr(batch_idx, 0, sy1 - 1, 0)[sx1[j] - 1]),
+                                          (wTop * wL[j] * scaleA[j]));
             if (hasTop && hasR[j])
-                acc[j] = acc[j] + src.ptr(batch_idx, 0, sy1 - 1, 0)[sx2[j]] * (wTop * wR[j] * scaleA[j]);
+                acc[j]
+                    = NVCV_CUDA_ADDMUL(acc[j], (src.ptr(batch_idx, 0, sy1 - 1, 0)[sx2[j]]), (wTop * wR[j] * scaleA[j]));
             if (hasBot && hasR[j])
-                acc[j] = acc[j] + src.ptr(batch_idx, 0, sy2, 0)[sx2[j]] * (wBot * wR[j] * scaleA[j]);
+                acc[j] = NVCV_CUDA_ADDMUL(acc[j], (src.ptr(batch_idx, 0, sy2, 0)[sx2[j]]), (wBot * wR[j] * scaleA[j]));
             if (hasBot && hasL[j])
-                acc[j] = acc[j] + src.ptr(batch_idx, 0, sy2, 0)[sx1[j] - 1] * (wBot * wL[j] * scaleA[j]);
+                acc[j]
+                    = NVCV_CUDA_ADDMUL(acc[j], (src.ptr(batch_idx, 0, sy2, 0)[sx1[j] - 1]), (wBot * wL[j] * scaleA[j]));
         }
 
 #pragma unroll
@@ -3029,9 +3039,9 @@ __global__ void resize_bilinear_planar(cuda::ImageBatchVarShapeWrap<const T> src
                 continue;
             const int   sx = sxA[i];
             const float fx = fxA[i];
-            *dst.ptr(batch_idx, plane, dst_y, dx[i])
-                = cuda::SaturateCast<T>((1.0f - fx) * (aPtr[sx] * (1.0f - fy) + bPtr[sx] * fy)
-                                        + fx * (aPtr[sx + 1] * (1.0f - fy) + bPtr[sx + 1] * fy));
+            *dst.ptr(batch_idx, plane, dst_y, dx[i]) = cuda::SaturateCast<T>(
+                NVCV_CUDA_ADDMUL((1.0f - fx) * NVCV_CUDA_ADDMUL(aPtr[sx] * (1.0f - fy), bPtr[sx], fy), fx,
+                                 NVCV_CUDA_ADDMUL(aPtr[sx + 1] * (1.0f - fy), bPtr[sx + 1], fy)));
         }
     }
 }
@@ -3103,7 +3113,7 @@ __global__ void resize_bicubic_planar(cuda::ImageBatchVarShapeWrap<const T> src,
 #pragma unroll
                 for (int col = 0; col < 4; ++col)
                 {
-                    accum += cY[row] * cX[col] * *src.ptr(batch_idx, plane, csy[row], csx[col]);
+                    NVCV_CUDA_MULACC(accum, cY[row] * cX[col], (*src.ptr(batch_idx, plane, csy[row], csx[col])));
                 }
             }
             *dst.ptr(batch_idx, plane, dst_y, dst_x) = cuda::SaturateCast<T>(accum);
@@ -3197,15 +3207,15 @@ __global__ void resize_area_fractional_pack_planar(cuda::ImageBatchVarShapeWrap<
                 const T *srcRow = src.ptr(batch_idx, plane, dy, 0);
                 for (int dx = sx1[ti]; dx < sx2[ti]; ++dx)
                 {
-                    acc = acc + srcRow[dx] * scale[ti];
+                    acc = NVCV_CUDA_ADDMUL(acc, srcRow[dx], scale[ti]);
                 }
                 if (sx1[ti] > fsx1[ti])
                 {
-                    acc = acc + srcRow[sx1[ti] - 1] * ((sx1[ti] - fsx1[ti]) * scale[ti]);
+                    acc = NVCV_CUDA_ADDMUL(acc, srcRow[sx1[ti] - 1], ((sx1[ti] - fsx1[ti]) * scale[ti]));
                 }
                 if (sx2[ti] < fsx2[ti])
                 {
-                    acc = acc + srcRow[sx2[ti]] * ((fsx2[ti] - sx2[ti]) * scale[ti]);
+                    acc = NVCV_CUDA_ADDMUL(acc, srcRow[sx2[ti]], ((fsx2[ti] - sx2[ti]) * scale[ti]));
                 }
             }
             if (sy1 > fsy1)
@@ -3213,7 +3223,7 @@ __global__ void resize_area_fractional_pack_planar(cuda::ImageBatchVarShapeWrap<
                 const T *topRow = src.ptr(batch_idx, plane, sy1 - 1, 0);
                 for (int dx = sx1[ti]; dx < sx2[ti]; ++dx)
                 {
-                    acc = acc + topRow[dx] * ((sy1 - fsy1) * scale[ti]);
+                    acc = NVCV_CUDA_ADDMUL(acc, topRow[dx], ((sy1 - fsy1) * scale[ti]));
                 }
             }
             if (sy2 < fsy2)
@@ -3221,31 +3231,28 @@ __global__ void resize_area_fractional_pack_planar(cuda::ImageBatchVarShapeWrap<
                 const T *botRow = src.ptr(batch_idx, plane, sy2, 0);
                 for (int dx = sx1[ti]; dx < sx2[ti]; ++dx)
                 {
-                    acc = acc + botRow[dx] * ((fsy2 - sy2) * scale[ti]);
+                    acc = NVCV_CUDA_ADDMUL(acc, botRow[dx], ((fsy2 - sy2) * scale[ti]));
                 }
             }
             if ((sy1 > fsy1) && (sx1[ti] > fsx1[ti]))
             {
-                acc = acc
-                    + src.ptr(batch_idx, plane, sy1 - 1, 0)[sx1[ti] - 1]
-                          * ((sy1 - fsy1) * (sx1[ti] - fsx1[ti]) * scale[ti]);
+                acc = NVCV_CUDA_ADDMUL(acc, (src.ptr(batch_idx, plane, sy1 - 1, 0)[sx1[ti] - 1]),
+                                       ((sy1 - fsy1) * (sx1[ti] - fsx1[ti]) * scale[ti]));
             }
             if ((sy1 > fsy1) && (sx2[ti] < fsx2[ti]))
             {
-                acc = acc
-                    + src.ptr(batch_idx, plane, sy1 - 1, 0)[sx2[ti]]
-                          * ((sy1 - fsy1) * (fsx2[ti] - sx2[ti]) * scale[ti]);
+                acc = NVCV_CUDA_ADDMUL(acc, (src.ptr(batch_idx, plane, sy1 - 1, 0)[sx2[ti]]),
+                                       ((sy1 - fsy1) * (fsx2[ti] - sx2[ti]) * scale[ti]));
             }
             if ((sy2 < fsy2) && (sx2[ti] < fsx2[ti]))
             {
-                acc = acc
-                    + src.ptr(batch_idx, plane, sy2, 0)[sx2[ti]] * ((fsy2 - sy2) * (fsx2[ti] - sx2[ti]) * scale[ti]);
+                acc = NVCV_CUDA_ADDMUL(acc, (src.ptr(batch_idx, plane, sy2, 0)[sx2[ti]]),
+                                       ((fsy2 - sy2) * (fsx2[ti] - sx2[ti]) * scale[ti]));
             }
             if ((sy2 < fsy2) && (sx1[ti] > fsx1[ti]))
             {
-                acc = acc
-                    + src.ptr(batch_idx, plane, sy2, 0)[sx1[ti] - 1]
-                          * ((fsy2 - sy2) * (sx1[ti] - fsx1[ti]) * scale[ti]);
+                acc = NVCV_CUDA_ADDMUL(acc, (src.ptr(batch_idx, plane, sy2, 0)[sx1[ti] - 1]),
+                                       ((fsy2 - sy2) * (sx1[ti] - fsx1[ti]) * scale[ti]));
             }
 
             out[i] = cuda::SaturateCast<T>(acc);
@@ -3328,7 +3335,7 @@ __global__ void resize_area_ocv_align_planar(const cuda::ImageBatchVarShapeWrap<
                     const T *srcRow = src.ptr(batch_idx, plane, dy, 0);
                     for (int dx = sx1; dx < sx2; ++dx)
                     {
-                        out = out + srcRow[dx] * scale;
+                        out = NVCV_CUDA_ADDMUL(out, srcRow[dx], scale);
                     }
                 }
                 *dst.ptr(batch_idx, plane, y, x) = cuda::SaturateCast<T>(out);
@@ -3356,17 +3363,17 @@ __global__ void resize_area_ocv_align_planar(const cuda::ImageBatchVarShapeWrap<
                 const T *srcRow = src.ptr(batch_idx, plane, dy, 0);
                 for (int dx = sx1; dx < sx2; ++dx)
                 {
-                    out = out + srcRow[dx] * scale;
+                    out = NVCV_CUDA_ADDMUL(out, srcRow[dx], scale);
                 }
                 if (sx1 > fsx1)
                 {
                     srcCoord.x = sx1 - 1;
-                    out        = out + brd_src.value(srcCoord) * ((sx1 - fsx1) * scale);
+                    out        = NVCV_CUDA_ADDMUL(out, brd_src.value(srcCoord), ((sx1 - fsx1) * scale));
                 }
                 if (sx2 < fsx2)
                 {
                     srcCoord.x = sx2;
-                    out        = out + brd_src.value(srcCoord) * ((fsx2 - sx2) * scale);
+                    out        = NVCV_CUDA_ADDMUL(out, brd_src.value(srcCoord), ((fsx2 - sx2) * scale));
                 }
             }
             if (sy1 > fsy1)
@@ -3375,7 +3382,7 @@ __global__ void resize_area_ocv_align_planar(const cuda::ImageBatchVarShapeWrap<
                 for (int dx = sx1; dx < sx2; ++dx)
                 {
                     srcCoord.x = dx;
-                    out        = out + brd_src.value(srcCoord) * ((sy1 - fsy1) * scale);
+                    out        = NVCV_CUDA_ADDMUL(out, brd_src.value(srcCoord), ((sy1 - fsy1) * scale));
                 }
             }
             if (sy2 < fsy2)
@@ -3384,32 +3391,32 @@ __global__ void resize_area_ocv_align_planar(const cuda::ImageBatchVarShapeWrap<
                 for (int dx = sx1; dx < sx2; ++dx)
                 {
                     srcCoord.x = dx;
-                    out        = out + brd_src.value(srcCoord) * ((fsy2 - sy2) * scale);
+                    out        = NVCV_CUDA_ADDMUL(out, brd_src.value(srcCoord), ((fsy2 - sy2) * scale));
                 }
             }
             if ((sy1 > fsy1) && (sx1 > fsx1))
             {
                 srcCoord.y = (sy1 - 1);
                 srcCoord.x = (sx1 - 1);
-                out        = out + brd_src.value(srcCoord) * ((sy1 - fsy1) * (sx1 - fsx1) * scale);
+                out        = NVCV_CUDA_ADDMUL(out, brd_src.value(srcCoord), ((sy1 - fsy1) * (sx1 - fsx1) * scale));
             }
             if ((sy1 > fsy1) && (sx2 < fsx2))
             {
                 srcCoord.y = (sy1 - 1);
                 srcCoord.x = sx2;
-                out        = out + brd_src.value(srcCoord) * ((sy1 - fsy1) * (fsx2 - sx2) * scale);
+                out        = NVCV_CUDA_ADDMUL(out, brd_src.value(srcCoord), ((sy1 - fsy1) * (fsx2 - sx2) * scale));
             }
             if ((sy2 < fsy2) && (sx2 < fsx2))
             {
                 srcCoord.y = sy2;
                 srcCoord.x = sx2;
-                out        = out + brd_src.value(srcCoord) * ((fsy2 - sy2) * (fsx2 - sx2) * scale);
+                out        = NVCV_CUDA_ADDMUL(out, brd_src.value(srcCoord), ((fsy2 - sy2) * (fsx2 - sx2) * scale));
             }
             if ((sy2 < fsy2) && (sx1 > fsx1))
             {
                 srcCoord.y = sy2;
                 srcCoord.x = sx1 - 1;
-                out        = out + brd_src.value(srcCoord) * ((fsy2 - sy2) * (sx1 - fsx1) * scale);
+                out        = NVCV_CUDA_ADDMUL(out, brd_src.value(srcCoord), ((fsy2 - sy2) * (sx1 - fsx1) * scale));
             }
             *dst.ptr(batch_idx, plane, y, x) = cuda::SaturateCast<T>(out);
         }

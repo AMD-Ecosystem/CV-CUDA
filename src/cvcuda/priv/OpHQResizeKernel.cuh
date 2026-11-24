@@ -1117,7 +1117,7 @@ void __forceinline__ __device__ ResampleVert(const PassOutWrap outWrap, const Pa
                             }
                             else
                             {
-                                tmp = tmp + flt * cuda::StaticCast<float>(px);
+                                tmp = NVCV_CUDA_ADDMUL(tmp, flt, cuda::StaticCast<float>(px));
                             }
                         }
 
