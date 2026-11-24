@@ -329,6 +329,18 @@ __global__ void ResizeLinear(const SrcWrapper src, DstWrapper dst, const Geometr
         const T *aPtr = src.ptr(batch_idx, ty.s, 0);     // upper row
         const T *bPtr = src.ptr(batch_idx, ty.s + 1, 0); // lower row
 
+#if defined(__HIP_DEVICE_COMPILE__)
+        // For these instantiations nvcc fuses the lower-row product in the first column's blend.
+        constexpr bool kFuseLowerRow
+            = std::is_same_v<Geometry, VarShapeGeometry> && (std::is_same_v<T, float> || std::is_same_v<T, float4>);
+        if constexpr (kFuseLowerRow)
+        {
+            *dst.ptr(batch_idx, dst_y, dst_x) = cuda::SaturateCast<T>(
+                NVCV_CUDA_MULADD((1.0f - tx.f), NVCV_CUDA_ADDMUL(aPtr[tx.s] * (1.0f - ty.f), bPtr[tx.s], ty.f),
+                                 tx.f * NVCV_CUDA_MULADD(aPtr[tx.s + 1], (1.0f - ty.f), bPtr[tx.s + 1] * ty.f)));
+            return;
+        }
+#endif
         *dst.ptr(batch_idx, dst_y, dst_x) = cuda::SaturateCast<T>(
             NVCV_CUDA_MULADD((1.0f - tx.f), NVCV_CUDA_MULADD(aPtr[tx.s], (1.0f - ty.f), bPtr[tx.s] * ty.f),
                              tx.f * NVCV_CUDA_MULADD(aPtr[tx.s + 1], (1.0f - ty.f), bPtr[tx.s + 1] * ty.f)));
