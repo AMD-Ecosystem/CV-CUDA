@@ -227,6 +227,16 @@ __device__ __forceinline__ T LinearReadMaybe(SrcWrapper src, const T *srcRow, in
 template<typename T>
 __device__ __forceinline__ T LinearBlend(T p00, T p10, T p01, T p11, float2 w)
 {
+#if defined(__HIP_DEVICE_COMPILE__)
+    // nvcc fuses the p10 product of the first two terms for these types and the p00 product for the others.
+    if constexpr (std::is_same_v<T, uchar1> || std::is_same_v<T, uchar4>)
+    {
+        return cuda::SaturateCast<T>(NVCV_CUDA_ADDMUL(
+            NVCV_CUDA_ADDMUL(NVCV_CUDA_ADDMUL(p00 * ((1.f - w.x) * (1.f - w.y)), p10, (w.x * (1.f - w.y))), p01,
+                             ((1.f - w.x) * w.y)),
+            p11, (w.x * w.y)));
+    }
+#endif
     return cuda::SaturateCast<T>(
         NVCV_CUDA_ADDMUL(NVCV_CUDA_ADDMUL(NVCV_CUDA_MULADD(p00, ((1.f - w.x) * (1.f - w.y)), p10 * (w.x * (1.f - w.y))),
                                           p01, ((1.f - w.x) * w.y)),
